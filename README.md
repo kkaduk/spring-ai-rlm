@@ -1,6 +1,7 @@
 # Spring AI Recursive Language Models (RLMs)
 
-A production-ready microservice implementing Recursive Language Models using Spring AI framework.
+A spring AI microservice implementing Recursive Language Models using Spring AI framework (not yet ready).
+https://github.com/alexzhang13/rlm 
 
 ## Features
 
