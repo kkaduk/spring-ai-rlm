@@ -1,0 +1,15 @@
+spring:
+  ai:
+    openai:
+      api-key: test-key-for-testing
+      
+rlm:
+  max-depth: 2
+  max-branching: 2
+
+# Template configuration
+prompt:
+  template:
+    cache:
+      enabled: true
+      ttl: 3600
