@@ -77,8 +77,27 @@ public class DefaultRlmClient implements RlmClient {
     }
 
     private RecursionStrategy resolveStrategy(String strategyName) {
-        String key = strategyName + "Recursion";
-        RecursionStrategy strategy = recursionStrategies.get(key);
+        String beanName;
+        if (strategyName == null || strategyName.isBlank()) {
+            beanName = "depthFirstRecursion";
+        } else {
+            switch (strategyName.toLowerCase()) {
+                case "depth-first":
+                case "depthfirst":
+                case "depth_first":
+                    beanName = "depthFirstRecursion";
+                    break;
+                case "breadth-first":
+                case "breadthfirst":
+                case "breadth_first":
+                    beanName = "breadthFirstRecursion";
+                    break;
+                default:
+                    beanName = strategyName + "Recursion";
+            }
+        }
+
+        RecursionStrategy strategy = recursionStrategies.get(beanName);
         if (strategy == null) {
             log.warn("Strategy {} not found, falling back to depth-first", strategyName);
             strategy = recursionStrategies.get("depthFirstRecursion");

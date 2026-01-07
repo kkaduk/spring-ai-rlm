@@ -2,43 +2,44 @@ package com.oracle.rlm.config;
 
 import org.springframework.ai.anthropic.AnthropicChatModel;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.google.genai.GoogleGenAiChatModel;
 import org.springframework.ai.openai.OpenAiChatModel;
-import org.springframework.beans.factory.annotation.Value;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.context.annotation.Primary;
 
 @Configuration
 public class OpenAIConfig {
-    
-    @Value("${spring.ai.openai.api-key}")
-    private String apiKey;
-    
-    @Value("${spring.ai.openai.chat.options.model:gpt-4}")
-    private String model;
-    
-    @Value("${spring.ai.openai.chat.options.temperature:0.7}")
-    private Double temperature;
-    
-     @Bean
+
+    /**
+     * Provide a single ChatClient.Builder bean by selecting the first available ChatModel.
+     * Prefer OpenAI, then Anthropic, then Google. If none are available, fail fast
+     * with a clear message (e.g., missing API key configuration).
+     */
+    @Bean
     @Primary
-    @ConditionalOnBean(GoogleGenAiChatModel.class)
-    public ChatClient.Builder geminiChatClientBuilder(GoogleGenAiChatModel chatModel) {
-        return ChatClient.builder(chatModel);
-    }
+    public ChatClient.Builder chatClientBuilder(
+            ObjectProvider<OpenAiChatModel> openAiProvider,
+            ObjectProvider<AnthropicChatModel> anthropicProvider,
+            ObjectProvider<GoogleGenAiChatModel> googleProvider) {
 
-    @Bean
-    @ConditionalOnBean(AnthropicChatModel.class)
-    public ChatClient.Builder anthropicChatClientBuilder(AnthropicChatModel chatModel) {
-        return ChatClient.builder(chatModel);
-    }
+        ChatModel model = openAiProvider.getIfAvailable();
+        if (model == null) {
+            model = anthropicProvider.getIfAvailable();
+        }
+        if (model == null) {
+            model = googleProvider.getIfAvailable();
+        }
 
-    @Bean
-    @ConditionalOnBean(OpenAiChatModel.class)
-    public ChatClient.Builder openAiChatClientBuilder(OpenAiChatModel chatModel) {
-        return ChatClient.builder(chatModel);
+        if (model == null) {
+            throw new IllegalStateException(
+                "No ChatModel bean available. Ensure at least one provider is configured "
+                + "(e.g., set spring.ai.openai.api-key/OPENAI_API_KEY or the relevant provider settings)."
+            );
+        }
+
+        return ChatClient.builder(model);
     }
-    
 }

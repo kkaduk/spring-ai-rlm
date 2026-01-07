@@ -7,16 +7,12 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
-import org.springframework.ai.chat.model.ChatModel;
-import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.cache.annotation.Cacheable;
-import org.springframework.context.ApplicationContext;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.UUID;
 
 @Service
@@ -24,33 +20,26 @@ import java.util.UUID;
 @Slf4j
 public class RecursiveThinkingService {
 
-    private ChatClient chatClient;
+    private final ChatClient.Builder chatClientBuilder;
+    private volatile ChatClient chatClient;
     private final PromptTemplateService promptTemplateService;
     private final RlmConfig rlmConfig;
     private final ObjectMapper objectMapper = new ObjectMapper();
-
-    private final Map<String, ChatClient> chatClients;
-    private final ApplicationContext applicationContext;
 
     public RecursionStep solveRecursively(String problem, String context, int currentDepth,
             int maxDepth, int maxBranching, String parentStepId) {
         long startTime = System.currentTimeMillis();
         String stepId = UUID.randomUUID().toString();
 
-        Map<String, ChatModel> chatModels = applicationContext.getBeansOfType(ChatModel.class);
-        if (!chatModels.isEmpty()) {
-            for (Map.Entry<String, ChatModel> entry : chatModels.entrySet()) {
-                String key = entry.getKey();
-                ChatModel model = entry.getValue();
-                this.chatClients.put(key, ChatClient.builder(model)
-                        .defaultSystem("")
-                        .build());
+        if (this.chatClient == null) {
+            synchronized (this) {
+                if (this.chatClient == null) {
+                    this.chatClient = chatClientBuilder
+                            .defaultSystem("")
+                            .build();
+                }
             }
-            log.info("Detected ChatModel beans: {}", this.chatClients.keySet());
         }
-        chatClient = chatClients.get("openAi");
-        // chatClient = chatClients.get("anthropic");
-        // chatClient = chatClients.get("google");
 
         log.info("Processing at depth {}: {}", currentDepth, problem.substring(0, Math.min(50, problem.length())));
 
