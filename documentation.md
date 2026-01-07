@@ -1,39 +1,51 @@
-# Documentation for `DepthFirstRecursion.java`
+# RLM System Documentation
 
-This document provides a detailed explanation of the `DepthFirstRecursion` class, its role within the Recursive Language Model (RLM) framework, and how it orchestrates a depth-first traversal of a problem space.
+This document provides a detailed explanation of the Recursive Language Model (RLM) system architecture, its core components, and the flow of a problem-solving request.
 
-## I. Overview
+## I. System Architecture Overview
 
-The `DepthFirstRecursion` class is a core component of the RLM system, designed to solve complex problems by breaking them down into smaller, manageable sub-problems and then synthesizing their solutions. It implements the `RecursionStrategy` interface, providing a specific, depth-first approach to the recursive problem-solving process.
+The RLM system is designed to solve complex problems by recursively breaking them down into smaller, manageable sub-problems and then synthesizing their solutions. The architecture is layered to separate concerns, with a clear flow from request handling to core recursive logic.
 
-This strategy is analogous to a depth-first search (DFS) algorithm on a tree. The "tree" in this context is the hierarchy of a problem and its sub-problems. The `DepthFirstRecursion` strategy explores as far as possible down each branch (sub-problem) before backtracking.
+The main components are:
+-   **`RlmController`**: The API endpoint that receives user requests.
+-   **`RlmService`**: A service layer that prepares the request for the core client.
+-   **`RlmClient`**: The central orchestrator that manages the problem-solving process.
+-   **`RecursionStrategy`**: A strategy pattern implementation for different traversal methods (e.g., depth-first, breadth-first).
+-   **`RecursiveThinkingService`**: The core engine that implements the recursive decomposition and synthesis logic, interacting with the Large Language Model (LLM).
 
-## II. System Diagram
+## II. System Sequence Diagram
 
-The following diagram illustrates the sequence of operations when the `DepthFirstRecursion` strategy is executed.
+The following diagram illustrates the sequence of operations for a typical problem-solving request.
 
 ```mermaid
 sequenceDiagram
     actor User
     participant RlmController
-    participant DepthFirstRecursion
+    participant RlmService
+    participant RlmClient as DefaultRlmClient
+    participant RecursionStrategy as (e.g., DepthFirstRecursion)
     participant RecursiveThinkingService
     participant LargeLanguageModel as LLM
 
-    User->>RlmController: POST /rlm (problem, strategy="depthFirstRecursion")
-    RlmController->>DepthFirstRecursion: execute(problem, context, maxDepth, maxBranching)
-    DepthFirstRecursion->>RecursiveThinkingService: solveRecursively(problem, context, depth=0, ...)
+    User->>RlmController: POST /api/v1/rlm/solve (RlmRequest)
+    RlmController->>RlmService: processRequest(request)
+    RlmService->>RlmClient: completion(coreRequest)
+    
+    RlmClient->>RlmClient: resolveStrategy(strategyName)
+    RlmClient->>RecursionStrategy: execute(problem, context, ...)
+    
+    RecursionStrategy->>RecursiveThinkingService: solveRecursively(problem, context, ...)
     
     loop Decomposition & Recursive Solving
-        RecursiveThinkingService->>LLM: Decompose problem into sub-problems
-        LLM-->>RecursiveThinkingService: {needsDecomposition: true, subProblems: [...]}
-        
-        Note over RecursiveThinkingService: For each sub-problem...
-        RecursiveThinkingService->>RecursiveThinkingService: solveRecursively(subProblem, context, depth+1, ...)
-        
         alt Base Case (depth == maxDepth or simple problem)
             RecursiveThinkingService->>LLM: Solve sub-problem directly
             LLM-->>RecursiveThinkingService: {solution: "..."}
+        else Recursive Step
+            RecursiveThinkingService->>LLM: Decompose problem into sub-problems
+            LLM-->>RecursiveThinkingService: {needsDecomposition: true, subProblems: [...]}
+            
+            Note over RecursiveThinkingService: For each sub-problem...
+            RecursiveThinkingService->>RecursiveThinkingService: solveRecursively(subProblem, context, depth+1, ...)
         end
     end
     
@@ -42,75 +54,45 @@ sequenceDiagram
         LLM-->>RecursiveThinkingService: {finalAnswer: "..."}
     end
 
-    RecursiveThinkingService-->>DepthFirstRecursion: return final solution
-    DepthFirstRecursion-->>RlmController: return final solution
-    RlmController-->>User: 200 OK (final solution)
+    RecursiveThinkingService-->>RecursionStrategy: return final solution (RecursionStep)
+    RecursionStrategy-->>RlmClient: return final solution (RecursionStep)
+    RlmClient-->>RlmService: return RlmCompletionResult
+    RlmService-->>RlmController: return RlmResponse
+    RlmController-->>User: 200 OK (RlmResponse)
 ```
 
-## III. Class Definition and Functionality
+## III. Component Breakdown
 
-### `com.oracle.rlm.strategy.DepthFirstRecursion.java`
+### 1. `RlmController`
+-   **File:** `com.oracle.rlm.controller.RlmController.java`
+-   **Role:** Acts as the entry point for all API requests.
+-   **Functionality:** It defines the `/api/v1/rlm/solve` endpoint, deserializes the incoming JSON request into an `RlmRequest` object, and passes it to the `RlmService`. It is responsible for handling HTTP-level concerns and basic error handling.
 
-```java
-package com.oracle.rlm.strategy;
+### 2. `RlmService`
+-   **File:** `com.oracle.rlm.service.RlmService.java`
+-   **Role:** Acts as a bridge between the controller and the core `RlmClient`.
+-   **Functionality:** It takes the `RlmRequest`, applies default configuration values (e.g., `maxDepth`), and transforms it into a `RlmCompletionRequest` suitable for the core client. This decouples the API model from the core domain model.
 
-import com.oracle.rlm.model.RecursionStep;
-import com.oracle.rlm.service.RecursiveThinkingService;
-import lombok.RequiredArgsConstructor;
-import org.springframework.stereotype.Component;
+### 3. `RlmClient` (`DefaultRlmClient`)
+-   **File:** `com.oracle.rlm.core.impl.DefaultRlmClient.java`
+-   **Role:** The central orchestrator of the problem-solving process.
+-   **Functionality:**
+    -   **Strategy Selection:** It resolves the requested `RecursionStrategy` (e.g., "depth-first") from a map of available strategy beans.
+    -   **Context Building:** It constructs the full context for the problem, combining any inline context from the request with data from the `RlmEnvironmentStore`.
+    -   **Execution:** It invokes the `execute` method of the selected strategy.
+    -   **Result Processing:** It takes the final `RecursionStep` returned by the strategy and transforms it into a `RlmCompletionResult`, extracting metrics like processing time, total steps, and thought processes.
 
-@Component("depthFirstRecursion")
-@RequiredArgsConstructor
-public class DepthFirstRecursion implements RecursionStrategy {
-    
-    private final RecursiveThinkingService recursiveThinkingService;
-    
-    @Override
-    public RecursionStep execute(String problem, String context, int maxDepth, int maxBranching) {
-        // Depth-first naturally follows the recursive approach
-        return recursiveThinkingService.solveRecursively(problem, context, 0, maxDepth, maxBranching, null);
-    }
-}
-```
+### 4. `RecursionStrategy` (e.g., `DepthFirstRecursion`)
+-   **File:** `com.oracle.rlm.strategy.DepthFirstRecursion.java`
+-   **Role:** Implements a specific method for traversing the problem-solving tree.
+-   **Functionality:** The `execute` method serves as the entry point for the recursive process. It immediately delegates the call to the `RecursiveThinkingService.solveRecursively` method. The choice of strategy primarily determines how the recursive calls will be structured in the future (e.g., sequentially for depth-first, or in parallel for a potential breadth-first implementation).
 
-### A. Annotations
-
--   `@Component("depthFirstRecursion")`: This annotation registers the class as a Spring component, making it available for dependency injection. The string `"depthFirstRecursion"` provides a unique identifier for this specific implementation of `RecursionStrategy`, allowing it to be selected at runtime (e.g., via a controller).
--   `@RequiredArgsConstructor`: A Lombok annotation that generates a constructor with all final fields as arguments. In this case, it creates a constructor to inject the `RecursiveThinkingService`.
-
-### B. Interface Implementation
-
-`DepthFirstRecursion` implements the `RecursionStrategy` interface, which mandates the implementation of the `execute` method. This adherence to a common interface allows for different recursion strategies (like breadth-first) to be developed and used interchangeably.
-
-### C. Dependencies
-
--   `RecursiveThinkingService`: This is the engine of the RLM system. `DepthFirstRecursion` delegates the entire problem-solving process to this service. The `solveRecursively` method within this service is designed in a way that naturally performs a depth-first traversal.
-
-## IV. Method: `execute`
-
-This is the primary method of the class and the entry point for the strategy.
-
-```java
-@Override
-public RecursionStep execute(String problem, String context, int maxDepth, int maxBranching) {
-    return recursiveThinkingService.solveRecursively(problem, context, 0, maxDepth, maxBranching, null);
-}
-```
-
-### A. Parameters
-
--   `problem` (String): The complex problem statement that needs to be solved.
--   `context` (String): Any additional context or information that might be useful for solving the problem.
--   `maxDepth` (int): The maximum number of recursive steps. This prevents infinite recursion and controls how deeply the problem can be decomposed.
--   `maxBranching` (int): The maximum number of sub-problems to generate at each decomposition step.
-
-### B. Logic
-
-The `execute` method's logic is straightforward:
-
-1.  It receives the problem and configuration parameters from its caller (typically a controller).
-2.  It immediately calls `recursiveThinkingService.solveRecursively`, passing along all the parameters.
-3.  It initializes the `currentDepth` to `0` and the `parentStepId` to `null`, as this is the root of the problem-solving tree.
-4.  It returns the `RecursionStep` object, which contains the complete, structured solution, including all sub-steps and reasoning.
-
-The comment, "Depth-first naturally follows the recursive approach," is key. The `solveRecursively` method in `RecursiveThinkingService` is a classic recursive function. It processes one sub-problem completely by calling itself, going deeper and deeper until a base case is hit, before it moves to the next sub-problem at the same level. This inherent behavior of the call stack in a recursive function results in a depth-first traversal of the problem space.
+### 5. `RecursiveThinkingService`
+-   **File:** `com.oracle.rlm.service.RecursiveThinkingService.java`
+-   **Role:** The engine of the RLM system, containing the core recursive logic.
+-   **Functionality:**
+    -   **Base Case:** Determines if a problem should be solved directly (if `currentDepth` reaches `maxDepth` or the problem is simple).
+    -   **Decomposition:** If not a base case, it calls the LLM with a "decompose" prompt to break the problem into smaller sub-problems.
+    -   **Recursion:** It calls itself for each sub-problem, incrementing the depth. This self-invocation naturally creates a depth-first traversal.
+    -   **Synthesis:** After the sub-problems are solved, it calls the LLM with an "aggregate" prompt to synthesize the individual solutions into a final answer for the parent problem.
+    -   **LLM Interaction:** Manages all communication with the Large Language Model, using prompts from the `PromptTemplateService`.

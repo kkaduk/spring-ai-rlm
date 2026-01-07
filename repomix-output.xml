@@ -52,6 +52,15 @@ src/
               RlmConfig.java
             controller/
               RlmController.java
+            core/
+              impl/
+                DefaultRlmClient.java
+                InMemoryRlmEnvironmentStore.java
+              RlmClient.java
+              RlmCompletionRequest.java
+              RlmCompletionResult.java
+              RlmEnvironment.java
+              RlmEnvironmentStore.java
             model/
               RecursionStep.java
               RlmRequest.java
@@ -59,8 +68,6 @@ src/
               ThoughtProcess.java
             service/
               PromptTemplateService.java
-              PromptTemplateService2.java
-              PromptTemplateServiceWithSpringAI.java
               RecursiveThinkingService.java
               RlmService.java
             strategy/
@@ -69,13 +76,6 @@ src/
               RecursionStrategy.java
             SpringAiRlmApplication.java
     resources/
-      prompts/
-        aggregate-prompt-springai.st
-        aggregate-prompt.st
-        decompose-prompt-springai.st
-        decompose-prompt.st
-        solve-prompt-springai.st
-        solve-prompt.st
       application-test.yml
       application.properties
       application.yml
@@ -88,58 +88,10 @@ src/
             RlmServiceTest.java
   docker-compose.yml
   Dockerfile
-  README.md
 </directory_structure>
 
 <files>
 This section contains the contents of the repository's files.
-
-<file path="src/main/java/com/oracle/rlm/config/OpenAIConfig.java">
-package com.oracle.rlm.config;
-
-import org.springframework.ai.anthropic.AnthropicChatModel;
-import org.springframework.ai.chat.client.ChatClient;
-import org.springframework.ai.google.genai.GoogleGenAiChatModel;
-import org.springframework.ai.openai.OpenAiChatModel;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
-import org.springframework.context.annotation.Primary;
-
-@Configuration
-public class OpenAIConfig {
-    
-    @Value("${spring.ai.openai.api-key}")
-    private String apiKey;
-    
-    @Value("${spring.ai.openai.chat.options.model:gpt-4}")
-    private String model;
-    
-    @Value("${spring.ai.openai.chat.options.temperature:0.7}")
-    private Double temperature;
-    
-     @Bean
-    @Primary
-    @ConditionalOnBean(GoogleGenAiChatModel.class)
-    public ChatClient.Builder geminiChatClientBuilder(GoogleGenAiChatModel chatModel) {
-        return ChatClient.builder(chatModel);
-    }
-
-    @Bean
-    @ConditionalOnBean(AnthropicChatModel.class)
-    public ChatClient.Builder anthropicChatClientBuilder(AnthropicChatModel chatModel) {
-        return ChatClient.builder(chatModel);
-    }
-
-    @Bean
-    @ConditionalOnBean(OpenAiChatModel.class)
-    public ChatClient.Builder openAiChatClientBuilder(OpenAiChatModel chatModel) {
-        return ChatClient.builder(chatModel);
-    }
-    
-}
-</file>
 
 <file path="src/main/java/com/oracle/rlm/config/RlmConfig.java">
 package com.oracle.rlm.config;
@@ -247,6 +199,292 @@ public class RlmController {
                 "type", e.getClass().getSimpleName()
             ));
     }
+}
+</file>
+
+<file path="src/main/java/com/oracle/rlm/core/impl/InMemoryRlmEnvironmentStore.java">
+package com.oracle.rlm.core.impl;
+
+import com.oracle.rlm.core.RlmEnvironment;
+import com.oracle.rlm.core.RlmEnvironmentStore;
+import org.springframework.stereotype.Component;
+
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+
+@Component
+public class InMemoryRlmEnvironmentStore implements RlmEnvironmentStore {
+
+    private final Map<String, RlmEnvironment> envs = new ConcurrentHashMap<>();
+
+    @Override
+    public RlmEnvironment createEnvironment(String label) {
+        String id = UUID.randomUUID().toString();
+        RlmEnvironment env = new SimpleRlmEnvironment(id, label);
+        envs.put(id, env);
+        return env;
+    }
+
+    @Override
+    public Optional<RlmEnvironment> getEnvironment(String id) {
+        return Optional.ofNullable(envs.get(id));
+    }
+
+    @Override
+    public void deleteEnvironment(String id) {
+        envs.remove(id);
+    }
+
+    private static class SimpleRlmEnvironment implements RlmEnvironment {
+
+        private final String id;
+        private final String label;
+        private final Map<String, String> chunks = new ConcurrentHashMap<>();
+
+        private SimpleRlmEnvironment(String id, String label) {
+            this.id = id;
+            this.label = label;
+        }
+
+        @Override
+        public String getId() {
+            return id;
+        }
+
+        @Override
+        public String getLabel() {
+            return label;
+        }
+
+        @Override
+        public String getContextChunk(String key) {
+            return chunks.get(key);
+        }
+
+        @Override
+        public void putContextChunk(String key, String value) {
+            chunks.put(key, value);
+        }
+
+        @Override
+        public String search(String query) {
+            // naive: search across values and return some concatenation
+            return chunks.entrySet().stream()
+                    .filter(e -> e.getValue() != null && e.getValue().contains(query))
+                    .map(Map.Entry::getValue)
+                    .limit(5)
+                    .reduce("", (a, b) -> a + "\n\n" + b);
+        }
+    }
+}
+</file>
+
+<file path="src/main/java/com/oracle/rlm/core/RlmClient.java">
+package com.oracle.rlm.core;
+
+public interface RlmClient {
+
+    /**
+     * Drop-in replacement for a normal LLM completion call, with recursive reasoning.
+     *
+     * @param request  the RLM request, including query, environmentId, etc.
+     * @return         a structured RLM result with final answer and optional reasoning tree.
+     */
+    RlmCompletionResult completion(RlmCompletionRequest request);
+}
+</file>
+
+<file path="src/main/java/com/oracle/rlm/core/RlmCompletionRequest.java">
+package com.oracle.rlm.core;
+
+import lombok.Builder;
+import lombok.Data;
+
+import java.time.Duration;
+import java.util.Map;
+
+@Data
+@Builder
+public class RlmCompletionRequest {
+
+    /**
+     * User query / instruction – analogous to a normal LLM prompt.
+     */
+    private String query;
+
+    /**
+     * Optional environment id that holds large context
+     * (documents, conversation history, etc.).
+     */
+    private String environmentId;
+
+    /**
+     * Optional extra context (small, prompt-sized).
+     */
+    private String inlineContext;
+
+    /**
+     * Maximum recursion depth for this call.
+     * If null, use default from RlmConfig.
+     */
+    private Integer maxDepth;
+
+    /**
+     * Maximum branching factor for decomposition.
+     */
+    private Integer maxBranching;
+
+    /**
+     * Which recursion strategy to use (depth-first, breadth-first, etc.).
+     */
+    @Builder.Default
+    private String strategy = "depth-first";
+
+    /**
+     * Whether to include the full reasoning / tree in the result.
+     */
+    @Builder.Default
+    private boolean verbose = false;
+
+    /**
+     * Optional per-call timeout, beyond the global config.
+     */
+    private Duration timeout;
+
+    /**
+     * Optional model / backend hints (e.g., "openai:gpt-4o", "anthropic:claude-3").
+     */
+    private Map<String, Object> backendHints;
+}
+</file>
+
+<file path="src/main/java/com/oracle/rlm/core/RlmCompletionResult.java">
+package com.oracle.rlm.core;
+
+import com.oracle.rlm.model.ThoughtProcess;
+import lombok.Builder;
+import lombok.Data;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
+import java.util.Map;
+
+@Data
+@Builder
+public class RlmCompletionResult {
+
+    /**
+     * Final answer returned by the recursive process.
+     */
+    private String finalAnswer;
+
+    /**
+     * Optional “raw” model output, if you keep it.
+     */
+    private String rawOutput;
+
+    /**
+     * Total number of recursive steps taken.
+     */
+    private Integer totalSteps;
+
+    /**
+     * Maximum recursion depth actually reached.
+     */
+    private Integer maxDepthReached;
+
+    /**
+     * Wall-clock processing time.
+     */
+    private Duration processingTime;
+
+    /**
+     * Timestamp for observability.
+     */
+    private Instant startedAt;
+
+    /**
+     * Strategy used ("depth-first", "breadth-first", etc.).
+     */
+    private String strategy;
+
+    /**
+     * Optional thought process, exposed when verbose=true.
+     * Reuses your existing ThoughtProcess model.
+     */
+    private List<ThoughtProcess> thoughtProcesses;
+
+    /**
+     * Metadata for observability (chosen backend, cache hits, etc.).
+     */
+    private Map<String, Object> metadata;
+}
+</file>
+
+<file path="src/main/java/com/oracle/rlm/core/RlmEnvironment.java">
+package com.oracle.rlm.core;
+
+/**
+ * Represents a logical environment in which an RLM call runs.
+ * It can hold arbitrarily large context outside the model’s prompt window.
+ */
+public interface RlmEnvironment {
+
+    /**
+     * Unique id of this environment (e.g., UUID).
+     */
+    String getId();
+
+    /**
+     * Human-readable label (for debug / UI).
+     */
+    String getLabel();
+
+    /**
+     * Retrieve a chunk of context by key (e.g. "doc:1234", "section:intro").
+     */
+    String getContextChunk(String key);
+
+    /**
+     * Store / update a chunk of context.
+     */
+    void putContextChunk(String key, String value);
+
+    /**
+     * Optional search API – lets the model “ask” to search the environment.
+     * In real RLM, this would be invoked via tool-calls / code in a REPL.
+     */
+    default String search(String query) {
+        // no-op or simple implementation; can be enhanced later
+        return "";
+    }
+}
+</file>
+
+<file path="src/main/java/com/oracle/rlm/core/RlmEnvironmentStore.java">
+package com.oracle.rlm.core;
+
+import java.util.Optional;
+
+public interface RlmEnvironmentStore {
+
+    /**
+     * Create a new environment, optionally pre-populated with some data.
+     */
+    RlmEnvironment createEnvironment(String label);
+
+    /**
+     * Lookup by id.
+     */
+    Optional<RlmEnvironment> getEnvironment(String id);
+
+    /**
+     * Remove when no longer needed (optional).
+     */
+    void deleteEnvironment(String id);
 }
 </file>
 
@@ -485,189 +723,598 @@ public class PromptTemplateService {
 }
 </file>
 
-<file path="src/main/java/com/oracle/rlm/service/PromptTemplateService2.java">
-package com.oracle.rlm.service;
+<file path="src/main/java/com/oracle/rlm/strategy/BreadthFirstRecursion.java">
+package com.oracle.rlm.strategy;
 
-import org.springframework.core.io.Resource;
-import org.springframework.core.io.ResourceLoader;
-import org.springframework.stereotype.Service;
-import org.springframework.util.StreamUtils;
+import com.oracle.rlm.model.RecursionStep;
+import com.oracle.rlm.service.RecursiveThinkingService;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Component;
 
-import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
-/**
- * Update version using promp template files from resources
- */
-
-@Service
-public class PromptTemplateService2 {
+@Component("breadthFirstRecursion")
+@RequiredArgsConstructor
+public class BreadthFirstRecursion implements RecursionStrategy {
     
-    private final ResourceLoader resourceLoader;
-    private final Map<String, String> templateCache = new HashMap<>();
+    private final RecursiveThinkingService recursiveThinkingService;
     
-    public PromptTemplateService2(ResourceLoader resourceLoader) {
-        this.resourceLoader = resourceLoader;
-    }
-    
-    public String createDecomposePrompt(String problem, String context, int maxBranching) {
-        String template = loadTemplate("classpath:prompts/decompose-prompt.st");
-        
-        return template
-            .replace("{problem}", problem)
-            .replace("{maxBranching}", String.valueOf(maxBranching))
-            .replace("{context}", context != null ? "" : "{context}")
-            .replace("{contextValue}", context != null ? context : "")
-            .replace("{/context}", context != null ? "" : "{/context}");
-    }
-    
-    public String createSolvePrompt(String problem, String context) {
-        String template = loadTemplate("classpath:prompts/solve-prompt.st");
-        
-        String prompt = template.replace("{problem}", problem);
-        
-        if (context != null && !context.isBlank()) {
-            prompt = prompt
-                .replace("{context}", "")
-                .replace("{contextValue}", context)
-                .replace("{/context}", "");
-        } else {
-            // Remove context section if not provided
-            prompt = prompt
-                .replaceAll("\\{context\\}[\\s\\S]*?\\{/context\\}", "");
-        }
-        
-        return prompt;
-    }
-    
-    public String createAggregatePrompt(String originalProblem, List<String> subProblems, 
-                                       List<String> solutions, String context) {
-        String template = loadTemplate("classpath:prompts/aggregate-prompt.st");
-        
-        // Build sub-problems and solutions section
-        StringBuilder subProblemsSection = new StringBuilder();
-        for (int i = 0; i < subProblems.size(); i++) {
-            subProblemsSection.append(String.format("Sub-problem %d: %s%n", i + 1, subProblems.get(i)));
-            subProblemsSection.append(String.format("Solution %d: %s%n", i + 1, solutions.get(i)));
-            subProblemsSection.append("\n---\n\n");
-        }
-        
-        String prompt = template
-            .replace("{originalProblem}", originalProblem)
-            .replaceAll("\\{subProblemsAndSolutions\\}[\\s\\S]*?\\{/subProblemsAndSolutions\\}", 
-                       subProblemsSection.toString());
-        
-        if (context != null && !context.isBlank()) {
-            prompt = prompt
-                .replace("{context}", "")
-                .replace("{contextValue}", context)
-                .replace("{/context}", "");
-        } else {
-            prompt = prompt
-                .replaceAll("\\{context\\}[\\s\\S]*?\\{/context\\}", "");
-        }
-        
-        return prompt;
-    }
-    
-    private String loadTemplate(String path) {
-        // Check cache first
-        if (templateCache.containsKey(path)) {
-            return templateCache.get(path);
-        }
-        
-        try {
-            Resource resource = resourceLoader.getResource(path);
-            String template = StreamUtils.copyToString(
-                resource.getInputStream(), 
-                StandardCharsets.UTF_8
-            );
-            templateCache.put(path, template);
-            return template;
-        } catch (IOException e) {
-            throw new RuntimeException("Failed to load template: " + path, e);
-        }
-    }
-    
-    /**
-     * Clear the template cache (useful for development/testing)
-     */
-    public void clearCache() {
-        templateCache.clear();
+    @Override
+    public RecursionStep execute(String problem, String context, int maxDepth, int maxBranching) {
+        // For breadth-first, we still use the recursive service but could optimize traversal
+        // This is a simplified version - in practice, you might want to modify the approach
+        return recursiveThinkingService.solveRecursively(problem, context, 0, maxDepth, maxBranching, null);
     }
 }
 </file>
 
-<file path="src/main/java/com/oracle/rlm/service/PromptTemplateServiceWithSpringAI.java">
-package com.oracle.rlm.service;
+<file path="src/main/java/com/oracle/rlm/strategy/DepthFirstRecursion.java">
+package com.oracle.rlm.strategy;
 
-import org.springframework.ai.chat.prompt.PromptTemplate;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.core.io.Resource;
-import org.springframework.stereotype.Service;
+import com.oracle.rlm.model.RecursionStep;
+import com.oracle.rlm.service.RecursiveThinkingService;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Component;
 
-import java.util.HashMap;
+@Component("depthFirstRecursion")
+@RequiredArgsConstructor
+public class DepthFirstRecursion implements RecursionStrategy {
+    
+    private final RecursiveThinkingService recursiveThinkingService;
+    
+    @Override
+    public RecursionStep execute(String problem, String context, int maxDepth, int maxBranching) {
+        // Depth-first naturally follows the recursive approach
+        return recursiveThinkingService.solveRecursively(problem, context, 0, maxDepth, maxBranching, null);
+    }
+}
+</file>
+
+<file path="src/main/java/com/oracle/rlm/strategy/RecursionStrategy.java">
+package com.oracle.rlm.strategy;
+
+import com.oracle.rlm.model.RecursionStep;
+
+public interface RecursionStrategy {
+    RecursionStep execute(String problem, String context, int maxDepth, int maxBranching);
+}
+</file>
+
+<file path="src/main/java/com/oracle/rlm/SpringAiRlmApplication.java">
+package com.oracle.rlm;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.cache.annotation.EnableCaching;
+
+@SpringBootApplication
+@EnableCaching
+public class SpringAiRlmApplication {
+    
+    public static void main(String[] args) {
+        SpringApplication.run(SpringAiRlmApplication.class, args);
+    }
+}
+</file>
+
+<file path="src/main/resources/application-test.yml">
+spring:
+  ai:
+    openai:
+      api-key: test-key-for-testing
+      
+rlm:
+  max-depth: 2
+  max-branching: 2
+
+# Template configuration
+prompt:
+  template:
+    cache:
+      enabled: true
+      ttl: 3600
+</file>
+
+<file path="src/main/resources/application.properties">
+spring.application.name=spring-ai-rlm
+
+spring.ai.openai.api-key=${OPENAI_API_KEY}
+spring.ai.openai.chat.options.model=gpt-4
+spring.ai.openai.chat.options.temperature=0.7
+spring.ai.openai.chat.options.max-tokens=2000
+
+spring.cache.type=caffeine
+spring.cache.caffeine.spec=maximumSize=100,expireAfterWrite=3600s
+
+server.port=8080
+
+# RLM Configuration
+rlm.max-depth=3
+rlm.max-branching=3
+rlm.timeout-seconds=30
+rlm.enable-caching=true
+rlm.decomposition-temperature=0.8
+rlm.solving-temperature=0.7
+rlm.aggregation-temperature=0.6
+
+logging.level.com.example.rlm=DEBUG
+logging.level.org.springframework.ai=INFO
+logging.pattern.console=%d{yyyy-MM-dd HH:mm:ss} - %msg%n
+
+
+spring.ai.chat.client.enabled=false
+# spring.ai.model.chat=google-genai
+# spring.ai.model.chat=anthropic
+# spring.ai.model.chat=openai
+# spring.ai.model.chat=none
+
+# --- Google Gemini Configuration ---
+spring.ai.google.genai.api-key=${GEMINI_API_KEY:your-api-key-here}
+spring.ai.google.genai.chat.options.model=gemini-3-pro-preview
+# spring.ai.google.genai.chat.options.model=gemma-3-27b-it
+# spring.ai.google.genai.chat.options.model=gemini-2.5-flash
+spring.ai.google.genai.enabled=false
+# spring.ai.google.genai.chat.options.temperature=0.1
+spring.ai.google.genai.chat.options.response-mime-type=text/plain
+# spring.ai.google.genai.chat.options.top-k=40
+# spring.ai.google.genai.chat.options.top-p=0.95
+# spring.ai.google.genai.chat.options.candidate-count=1
+# spring.ai.google.genai.chat.options.thinking-budget
+spring.ai.google.genai.chat.enable-cached-content=false
+
+# Disable audio/speech and transcription auto-configs to avoid requiring OpenAI keys in tests
+spring.ai.model.audio.speech=none
+spring.ai.model.audio.transcription=none
+# Disable other model types to prevent OpenAI auto-config from requiring keys in tests
+spring.ai.model.embedding=none
+spring.ai.model.image=none
+spring.ai.model.rerank=none
+
+#Antropic
+spring.ai.anthropic.chat.options.model=claude-opus-4-5
+#spring.ai.anthropic.chat.options.model=claude-opus-4-5
+# spring.ai.anthropic.chat.options.temperature=0.1
+spring.ai.anthropic.api-key=${ANTHROPIC_API_KEY:your-api-key-here}
+spring.ai.anthropic.enabled=true
+# spring.ai.anthropic.genai.chat.options.top-p=0.9
+spring.ai.anthropic.chat.options.max-tokens=40000
+
+
+
+#OpenaAI
+spring.ai.openai.chat.options.model=gpt-5.2
+#spring.ai.openai.chat.options.model=gpt-4
+spring.ai.openai.chat.options.temperature=1
+spring.ai.openai.api-key=${OPENAI_API_KEY:your-api-key-here}
+spring.ai.openai.enabled=false
+# spring.ai.openai.genai.chat.options.top-p=0.9
+# spring.ai.openai.chat.options.responseFormat=text
+# spring.ai.openai.chat.options.temperature=0.1
+</file>
+
+<file path="src/main/resources/application.yml">
+spring:
+  application:
+    name: spring-ai-rlm
+  
+  ai:
+    openai:
+      api-key: ${OPENAI_API_KEY}
+      chat:
+        options:
+          model: gpt-4
+          temperature: 0.7
+          max-tokens: 2000
+  
+  cache:
+    type: caffeine
+    caffeine:
+      spec: maximumSize=100,expireAfterWrite=3600s
+
+server:
+  port: 8080
+
+# RLM Configuration
+rlm:
+  max-depth: 3
+  max-branching: 3
+  timeout-seconds: 30
+  enable-caching: true
+  decomposition-temperature: 0.8
+  solving-temperature: 0.7
+  aggregation-temperature: 0.6
+
+logging:
+  level:
+    com.example.rlm: DEBUG
+    org.springframework.ai: INFO
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} - %msg%n"
+</file>
+
+<file path="src/test/java/com/example/rlm/PromptTemplateServiceTest.java">
+package com.example.rlm;
+
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.test.context.TestPropertySource;
+
+import com.oracle.rlm.service.PromptTemplateService;
+import com.oracle.rlm.SpringAiRlmApplication;
+
+import java.util.Arrays;
 import java.util.List;
-import java.util.Map;
 
-@Service
-public class PromptTemplateServiceWithSpringAI {
+import static org.junit.jupiter.api.Assertions.*;
+
+@SpringBootTest(classes = SpringAiRlmApplication.class)
+@TestPropertySource(properties = {
+    "spring.ai.openai.api-key=test-key"
+})
+class PromptTemplateServiceTest {
     
-    @Value("classpath:prompts/decompose-prompt.st")
-    private Resource decomposeTemplate;
+    @Autowired
+    private PromptTemplateService promptTemplateService;
     
-    @Value("classpath:prompts/solve-prompt.st")
-    private Resource solveTemplate;
-    
-    @Value("classpath:prompts/aggregate-prompt.st")
-    private Resource aggregateTemplate;
-    
-    public String createDecomposePrompt(String problem, String context, int maxBranching) {
-        Map<String, Object> model = new HashMap<>();
-        model.put("problem", problem);
-        model.put("maxBranching", maxBranching);
-        model.put("context", context != null ? context : "");
-        model.put("hasContext", context != null && !context.isBlank());
+    @Test
+    void testDecomposePromptCreation() {
+        String prompt = promptTemplateService.createDecomposePrompt(
+            "What is the meaning of life?",
+            "Philosophy context",
+            3
+        );
         
-        PromptTemplate promptTemplate = new PromptTemplate(decomposeTemplate);
-        return promptTemplate.render(model);
+        assertNotNull(prompt);
+        assertTrue(prompt.contains("What is the meaning of life?"));
+        assertTrue(prompt.contains("3"));
+        assertTrue(prompt.contains("Philosophy context"));
     }
     
-    public String createSolvePrompt(String problem, String context) {
-        Map<String, Object> model = new HashMap<>();
-        model.put("problem", problem);
-        model.put("context", context != null ? context : "");
-        model.put("hasContext", context != null && !context.isBlank());
+    @Test
+    void testSolvePromptCreation() {
+        String prompt = promptTemplateService.createSolvePrompt(
+            "Calculate 2+2",
+            null
+        );
         
-        PromptTemplate promptTemplate = new PromptTemplate(solveTemplate);
-        return promptTemplate.render(model);
+        assertNotNull(prompt);
+        assertTrue(prompt.contains("Calculate 2+2"));
+        assertFalse(prompt.contains("{context}"));
     }
     
-    public String createAggregatePrompt(String originalProblem, List<String> subProblems, 
-                                       List<String> solutions, String context) {
-        Map<String, Object> model = new HashMap<>();
-        model.put("originalProblem", originalProblem);
-        model.put("subProblems", subProblems);
-        model.put("solutions", solutions);
-        model.put("context", context != null ? context : "");
-        model.put("hasContext", context != null && !context.isBlank());
+    @Test
+    void testAggregatePromptCreation() {
+        List<String> subProblems = Arrays.asList(
+            "Sub-problem 1",
+            "Sub-problem 2"
+        );
+        List<String> solutions = Arrays.asList(
+            "Solution 1",
+            "Solution 2"
+        );
         
-        // Build indexed list for template
-        List<Map<String, Object>> subProblemsList = new java.util.ArrayList<>();
-        for (int i = 0; i < subProblems.size(); i++) {
-            Map<String, Object> item = new HashMap<>();
-            item.put("index", i + 1);
-            item.put("subProblem", subProblems.get(i));
-            item.put("solution", solutions.get(i));
-            subProblemsList.add(item);
+        String prompt = promptTemplateService.createAggregatePrompt(
+            "Original problem",
+            subProblems,
+            solutions,
+            "Test context"
+        );
+        
+        assertNotNull(prompt);
+        assertTrue(prompt.contains("Original problem"));
+        assertTrue(prompt.contains("Sub-problem 1"));
+        assertTrue(prompt.contains("Solution 1"));
+    }
+}
+</file>
+
+<file path="src/test/java/com/example/rlm/RlmServiceTest.java">
+package com.example.rlm;
+
+import com.oracle.rlm.model.RlmRequest;
+import com.oracle.rlm.model.RlmResponse;
+import com.oracle.rlm.service.RlmService;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import com.oracle.rlm.SpringAiRlmApplication;
+import org.springframework.test.context.TestPropertySource;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+@SpringBootTest(classes = SpringAiRlmApplication.class)
+@TestPropertySource(properties = {
+    "spring.ai.openai.api-key=test-key"
+})
+class RlmServiceTest {
+    
+    @Autowired(required = false)
+    private RlmService rlmService;
+    
+    @Test
+    void testContextLoads() {
+        // Test that Spring context loads successfully
+        assertNotNull(rlmService);
+    }
+    
+    @Test
+    void testRlmRequestBuilder() {
+        RlmRequest request = RlmRequest.builder()
+            .problem("What is 2+2?")
+            .maxDepth(2)
+            .maxBranching(2)
+            .strategy("depth-first")
+            .verbose(true)
+            .build();
+        
+        assertNotNull(request);
+        assertEquals("What is 2+2?", request.getProblem());
+        assertEquals(2, request.getMaxDepth());
+        assertEquals(2, request.getMaxBranching());
+    }
+}
+</file>
+
+<file path="src/docker-compose.yml">
+version: '3.8'
+
+services:
+  spring-ai-rlm:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - SPRING_PROFILES_ACTIVE=prod
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/v1/rlm/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+</file>
+
+<file path="src/Dockerfile">
+FROM eclipse-temurin:17-jdk-alpine AS build
+WORKDIR /workspace/app
+
+COPY mvnw .
+COPY .mvn .mvn
+COPY pom.xml .
+COPY src src
+
+RUN ./mvnw install -DskipTests
+RUN mkdir -p target/dependency && (cd target/dependency; jar -xf ../*.jar)
+
+FROM eclipse-temurin:17-jre-alpine
+VOLUME /tmp
+ARG DEPENDENCY=/workspace/app/target/dependency
+COPY --from=build ${DEPENDENCY}/BOOT-INF/lib /app/lib
+COPY --from=build ${DEPENDENCY}/META-INF /app/META-INF
+COPY --from=build ${DEPENDENCY}/BOOT-INF/classes /app
+
+ENTRYPOINT ["java","-cp","app:app/lib/*","com.example.rlm.SpringAiRlmApplication"]
+</file>
+
+<file path="src/main/java/com/oracle/rlm/config/OpenAIConfig.java">
+package com.oracle.rlm.config;
+
+import org.springframework.ai.anthropic.AnthropicChatModel;
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.model.ChatModel;
+import org.springframework.ai.google.genai.GoogleGenAiChatModel;
+import org.springframework.ai.openai.OpenAiChatModel;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
+
+@Configuration
+public class OpenAIConfig {
+
+    /**
+     * Provide a single ChatClient.Builder bean by selecting the first available ChatModel.
+     * Prefer OpenAI, then Anthropic, then Google. If none are available, fail fast
+     * with a clear message (e.g., missing API key configuration).
+     */
+    @Bean
+    @Primary
+    public ChatClient.Builder chatClientBuilder(
+            ObjectProvider<OpenAiChatModel> openAiProvider,
+            ObjectProvider<AnthropicChatModel> anthropicProvider,
+            ObjectProvider<GoogleGenAiChatModel> googleProvider) {
+
+        ChatModel model = openAiProvider.getIfAvailable();
+        if (model == null) {
+            model = anthropicProvider.getIfAvailable();
         }
-        model.put("subProblemsAndSolutions", subProblemsList);
-        
-        PromptTemplate promptTemplate = new PromptTemplate(aggregateTemplate);
-        return promptTemplate.render(model);
+        if (model == null) {
+            model = googleProvider.getIfAvailable();
+        }
+
+        if (model == null) {
+            throw new IllegalStateException(
+                "No ChatModel bean available. Ensure at least one provider is configured "
+                + "(e.g., set spring.ai.openai.api-key/OPENAI_API_KEY or the relevant provider settings)."
+            );
+        }
+
+        return ChatClient.builder(model);
+    }
+}
+</file>
+
+<file path="src/main/java/com/oracle/rlm/core/impl/DefaultRlmClient.java">
+package com.oracle.rlm.core.impl;
+
+import com.oracle.rlm.config.RlmConfig;
+import com.oracle.rlm.core.RlmClient;
+import com.oracle.rlm.core.RlmCompletionRequest;
+import com.oracle.rlm.core.RlmCompletionResult;
+import com.oracle.rlm.core.RlmEnvironmentStore;
+import com.oracle.rlm.model.RecursionStep;
+import com.oracle.rlm.model.ThoughtProcess;
+import com.oracle.rlm.service.RecursiveThinkingService;
+import com.oracle.rlm.strategy.RecursionStrategy;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.util.*;
+
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class DefaultRlmClient implements RlmClient {
+
+    private final RecursiveThinkingService recursiveThinkingService;
+    private final RlmConfig rlmConfig;
+    private final Map<String, RecursionStrategy> recursionStrategies;
+    private final RlmEnvironmentStore environmentStore;
+
+    @Override
+    public RlmCompletionResult completion(RlmCompletionRequest request) {
+        Instant start = Instant.now();
+
+        String strategyName = request.getStrategy() != null
+                ? request.getStrategy()
+                : "depth-first";
+        RecursionStrategy strategy = resolveStrategy(strategyName);
+
+        int maxDepth = Optional.ofNullable(request.getMaxDepth())
+                .orElse(rlmConfig.getMaxDepth());
+        int maxBranching = Optional.ofNullable(request.getMaxBranching())
+                .orElse(rlmConfig.getMaxBranching());
+
+        // Construct context: inlineContext + environment “view”
+        String combinedContext = buildContext(request);
+
+        RecursionStep root = strategy.execute(
+                request.getQuery(),
+                combinedContext,
+                maxDepth,
+                maxBranching
+        );
+
+        List<ThoughtProcess> thoughts = request.isVerbose()
+                ? extractThoughtProcesses(root)
+                : Collections.emptyList();
+
+        Duration processingTime = Duration.between(start, Instant.now());
+
+        Map<String, Object> metadata = new HashMap<>();
+        metadata.put("strategy", strategyName);
+        metadata.put("maxDepth", maxDepth);
+        metadata.put("maxBranching", maxBranching);
+        metadata.put("environmentId", request.getEnvironmentId());
+
+        return RlmCompletionResult.builder()
+                .finalAnswer(root.getResult())
+                .rawOutput(null) // you can pass raw LLM output if you capture it
+                .totalSteps(countTotalSteps(root))
+                .maxDepthReached(findMaxDepth(root))
+                .processingTime(processingTime)
+                .startedAt(start)
+                .strategy(strategyName)
+                .thoughtProcesses(thoughts)
+                .metadata(metadata)
+                .build();
+    }
+
+    private RecursionStrategy resolveStrategy(String strategyName) {
+        String beanName;
+        if (strategyName == null || strategyName.isBlank()) {
+            beanName = "depthFirstRecursion";
+        } else {
+            switch (strategyName.toLowerCase()) {
+                case "depth-first":
+                case "depthfirst":
+                case "depth_first":
+                    beanName = "depthFirstRecursion";
+                    break;
+                case "breadth-first":
+                case "breadthfirst":
+                case "breadth_first":
+                    beanName = "breadthFirstRecursion";
+                    break;
+                default:
+                    beanName = strategyName + "Recursion";
+            }
+        }
+
+        RecursionStrategy strategy = recursionStrategies.get(beanName);
+        if (strategy == null) {
+            log.warn("Strategy {} not found, falling back to depth-first", strategyName);
+            strategy = recursionStrategies.get("depthFirstRecursion");
+        }
+        return strategy;
+    }
+
+    private String buildContext(RlmCompletionRequest request) {
+        StringBuilder ctx = new StringBuilder();
+
+        if (request.getInlineContext() != null && !request.getInlineContext().isBlank()) {
+            ctx.append("INLINE CONTEXT:\n")
+               .append(request.getInlineContext())
+               .append("\n\n");
+        }
+
+        if (request.getEnvironmentId() != null) {
+            environmentStore.getEnvironment(request.getEnvironmentId())
+                    .ifPresent(env -> {
+                        ctx.append("ENVIRONMENT LABEL: ").append(env.getLabel()).append("\n");
+                        // You can design a smarter dump here:
+                        ctx.append("ENVIRONMENT SUMMARY (search(\"*\")):\n")
+                           .append(env.search("")); // naive: return some summary
+                    });
+        }
+
+        return ctx.length() > 0 ? ctx.toString() : null;
+    }
+
+    private int countTotalSteps(RecursionStep step) {
+        int count = 1;
+        for (RecursionStep sub : step.getSubSteps()) {
+            count += countTotalSteps(sub);
+        }
+        return count;
+    }
+
+    private int findMaxDepth(RecursionStep step) {
+        int max = step.getDepth();
+        for (RecursionStep sub : step.getSubSteps()) {
+            max = Math.max(max, findMaxDepth(sub));
+        }
+        return max;
+    }
+
+    private List<ThoughtProcess> extractThoughtProcesses(RecursionStep root) {
+        List<ThoughtProcess> processes = new ArrayList<>();
+        extractRecursive(root, processes);
+        return processes;
+    }
+
+    private void extractRecursive(RecursionStep step, List<ThoughtProcess> processes) {
+        ThoughtProcess process = ThoughtProcess.builder()
+                .level(step.getDepth())
+                .description(step.getProblem())
+                .build();
+
+        if ("decompose".equals(step.getAction())) {
+            step.getSubSteps().forEach(sub -> {
+                process.getSubProblems().add(sub.getProblem());
+                process.getSolutions().add(sub.getResult());
+            });
+            process.setSynthesis(step.getResult());
+        } else if ("solve".equals(step.getAction())) {
+            process.setSynthesis(step.getResult());
+        }
+
+        processes.add(process);
+
+        step.getSubSteps().forEach(sub -> extractRecursive(sub, processes));
     }
 }
 </file>
@@ -682,16 +1329,12 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
-import org.springframework.ai.chat.model.ChatModel;
-import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.cache.annotation.Cacheable;
-import org.springframework.context.ApplicationContext;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.UUID;
 
 @Service
@@ -699,33 +1342,26 @@ import java.util.UUID;
 @Slf4j
 public class RecursiveThinkingService {
 
-    private ChatClient chatClient;
+    private final ChatClient.Builder chatClientBuilder;
+    private volatile ChatClient chatClient;
     private final PromptTemplateService promptTemplateService;
     private final RlmConfig rlmConfig;
     private final ObjectMapper objectMapper = new ObjectMapper();
-
-    private final Map<String, ChatClient> chatClients;
-    private final ApplicationContext applicationContext;
 
     public RecursionStep solveRecursively(String problem, String context, int currentDepth,
             int maxDepth, int maxBranching, String parentStepId) {
         long startTime = System.currentTimeMillis();
         String stepId = UUID.randomUUID().toString();
 
-        Map<String, ChatModel> chatModels = applicationContext.getBeansOfType(ChatModel.class);
-        if (!chatModels.isEmpty()) {
-            for (Map.Entry<String, ChatModel> entry : chatModels.entrySet()) {
-                String key = entry.getKey();
-                ChatModel model = entry.getValue();
-                this.chatClients.put(key, ChatClient.builder(model)
-                        .defaultSystem("")
-                        .build());
+        if (this.chatClient == null) {
+            synchronized (this) {
+                if (this.chatClient == null) {
+                    this.chatClient = chatClientBuilder
+                            .defaultSystem("")
+                            .build();
+                }
             }
-            log.info("Detected ChatModel beans: {}", this.chatClients.keySet());
         }
-        chatClient = chatClients.get("openAi");
-        // chatClient = chatClients.get("anthropic");
-        // chatClient = chatClients.get("google");
 
         log.info("Processing at depth {}: {}", currentDepth, problem.substring(0, Math.min(50, problem.length())));
 
@@ -912,840 +1548,66 @@ package com.oracle.rlm.service;
 
 import com.oracle.rlm.config.RlmConfig;
 import com.oracle.rlm.model.*;
-import com.oracle.rlm.strategy.RecursionStrategy;
+import com.oracle.rlm.core.RlmClient;
+import com.oracle.rlm.core.RlmCompletionRequest;
+import com.oracle.rlm.core.RlmCompletionResult;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
-
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
 
 @Service
 @RequiredArgsConstructor
 @Slf4j
 public class RlmService {
     
-    private final RecursiveThinkingService recursiveThinkingService;
+    private final RlmClient rlmClient;
     private final RlmConfig rlmConfig;
-    private final Map<String, RecursionStrategy> recursionStrategies;
     
     public RlmResponse processRequest(RlmRequest request) {
         long startTime = System.currentTimeMillis();
-        
-        log.info("Processing RLM request: {}", request.getProblem());
-        
+        log.info("Processing RLM request via core client: {}", request.getProblem());
+
         int maxDepth = request.getMaxDepth() != null ? request.getMaxDepth() : rlmConfig.getMaxDepth();
         int maxBranching = request.getMaxBranching() != null ? request.getMaxBranching() : rlmConfig.getMaxBranching();
-        
+
         try {
-            // Get the appropriate recursion strategy
-            RecursionStrategy strategy = getStrategy(request.getStrategy());
-            
-            // Execute recursive solving
-            RecursionStep rootStep = recursiveThinkingService.solveRecursively(
-                request.getProblem(),
-                request.getContext(),
-                0,
-                maxDepth,
-                maxBranching,
-                null
-            );
-            
-            // Build response
+            RlmCompletionRequest coreRequest = RlmCompletionRequest.builder()
+                    .query(request.getProblem())
+                    .inlineContext(request.getContext())
+                    .maxDepth(maxDepth)
+                    .maxBranching(maxBranching)
+                    .strategy(request.getStrategy())
+                    .verbose(Boolean.TRUE.equals(request.getVerbose()))
+                    .build();
+
+            RlmCompletionResult result = rlmClient.completion(coreRequest);
+
             RlmResponse response = RlmResponse.builder()
-                .problem(request.getProblem())
-                .finalAnswer(rootStep.getResult())
-                .strategy(request.getStrategy())
-                .totalSteps(countTotalSteps(rootStep))
-                .maxDepthReached(findMaxDepth(rootStep))
-                .processingTimeMs(System.currentTimeMillis() - startTime)
-                .build();
-            
-            // Add thought processes if verbose
-            if (Boolean.TRUE.equals(request.getVerbose())) {
-                response.setThoughtProcesses(extractThoughtProcesses(rootStep));
-            }
-            
-            log.info("Completed RLM request in {}ms", response.getProcessingTimeMs());
-            
+                    .problem(request.getProblem())
+                    .finalAnswer(result.getFinalAnswer())
+                    .thoughtProcesses(result.getThoughtProcesses())
+                    .totalSteps(result.getTotalSteps())
+                    .maxDepthReached(result.getMaxDepthReached())
+                    .processingTimeMs(result.getProcessingTime() != null
+                            ? result.getProcessingTime().toMillis()
+                            : (System.currentTimeMillis() - startTime))
+                    .strategy(result.getStrategy())
+                    .build();
+
+            log.info("Completed RLM request via core in {}ms", response.getProcessingTimeMs());
             return response;
-            
+
         } catch (Exception e) {
-            log.error("Error processing RLM request: {}", e.getMessage(), e);
+            log.error("Error processing RLM request via core: {}", e.getMessage(), e);
             throw new RuntimeException("Failed to process RLM request: " + e.getMessage(), e);
         }
     }
     
-    private RecursionStrategy getStrategy(String strategyName) {
-        String key = strategyName != null ? strategyName + "Recursion" : "depthFirstRecursion";
-        RecursionStrategy strategy = recursionStrategies.get(key);
-        if (strategy == null) {
-            log.warn("Strategy {} not found, using depth-first", strategyName);
-            strategy = recursionStrategies.get("depthFirstRecursion");
-        }
-        return strategy;
-    }
     
-    private int countTotalSteps(RecursionStep step) {
-        int count = 1;
-        for (RecursionStep subStep : step.getSubSteps()) {
-            count += countTotalSteps(subStep);
-        }
-        return count;
-    }
     
-    private int findMaxDepth(RecursionStep step) {
-        int maxDepth = step.getDepth();
-        for (RecursionStep subStep : step.getSubSteps()) {
-            maxDepth = Math.max(maxDepth, findMaxDepth(subStep));
-        }
-        return maxDepth;
-    }
     
-    private List<ThoughtProcess> extractThoughtProcesses(RecursionStep step) {
-        List<ThoughtProcess> processes = new ArrayList<>();
-        extractThoughtProcessesRecursive(step, processes);
-        return processes;
-    }
     
-    private void extractThoughtProcessesRecursive(RecursionStep step, List<ThoughtProcess> processes) {
-        ThoughtProcess process = ThoughtProcess.builder()
-            .level(step.getDepth())
-            .description(step.getProblem())
-            .build();
-        
-        if ("decompose".equals(step.getAction())) {
-            for (RecursionStep subStep : step.getSubSteps()) {
-                process.getSubProblems().add(subStep.getProblem());
-                process.getSolutions().add(subStep.getResult());
-            }
-            process.setSynthesis(step.getResult());
-        } else if ("solve".equals(step.getAction())) {
-            process.setSynthesis(step.getResult());
-        }
-        
-        processes.add(process);
-        
-        // Recursively process sub-steps
-        for (RecursionStep subStep : step.getSubSteps()) {
-            extractThoughtProcessesRecursive(subStep, processes);
-        }
-    }
 }
-</file>
-
-<file path="src/main/java/com/oracle/rlm/strategy/BreadthFirstRecursion.java">
-package com.oracle.rlm.strategy;
-
-import com.oracle.rlm.model.RecursionStep;
-import com.oracle.rlm.service.RecursiveThinkingService;
-import lombok.RequiredArgsConstructor;
-import org.springframework.stereotype.Component;
-
-import java.util.*;
-
-@Component("breadthFirstRecursion")
-@RequiredArgsConstructor
-public class BreadthFirstRecursion implements RecursionStrategy {
-    
-    private final RecursiveThinkingService recursiveThinkingService;
-    
-    @Override
-    public RecursionStep execute(String problem, String context, int maxDepth, int maxBranching) {
-        // For breadth-first, we still use the recursive service but could optimize traversal
-        // This is a simplified version - in practice, you might want to modify the approach
-        return recursiveThinkingService.solveRecursively(problem, context, 0, maxDepth, maxBranching, null);
-    }
-}
-</file>
-
-<file path="src/main/java/com/oracle/rlm/strategy/DepthFirstRecursion.java">
-package com.oracle.rlm.strategy;
-
-import com.oracle.rlm.model.RecursionStep;
-import com.oracle.rlm.service.RecursiveThinkingService;
-import lombok.RequiredArgsConstructor;
-import org.springframework.stereotype.Component;
-
-@Component("depthFirstRecursion")
-@RequiredArgsConstructor
-public class DepthFirstRecursion implements RecursionStrategy {
-    
-    private final RecursiveThinkingService recursiveThinkingService;
-    
-    @Override
-    public RecursionStep execute(String problem, String context, int maxDepth, int maxBranching) {
-        // Depth-first naturally follows the recursive approach
-        return recursiveThinkingService.solveRecursively(problem, context, 0, maxDepth, maxBranching, null);
-    }
-}
-</file>
-
-<file path="src/main/java/com/oracle/rlm/strategy/RecursionStrategy.java">
-package com.oracle.rlm.strategy;
-
-import com.oracle.rlm.model.RecursionStep;
-
-public interface RecursionStrategy {
-    RecursionStep execute(String problem, String context, int maxDepth, int maxBranching);
-}
-</file>
-
-<file path="src/main/java/com/oracle/rlm/SpringAiRlmApplication.java">
-package com.oracle.rlm;
-
-import org.springframework.boot.SpringApplication;
-import org.springframework.boot.autoconfigure.SpringBootApplication;
-import org.springframework.cache.annotation.EnableCaching;
-
-@SpringBootApplication
-@EnableCaching
-public class SpringAiRlmApplication {
-    
-    public static void main(String[] args) {
-        SpringApplication.run(SpringAiRlmApplication.class, args);
-    }
-}
-</file>
-
-<file path="src/main/resources/prompts/aggregate-prompt-springai.st">
-
-</file>
-
-<file path="src/main/resources/prompts/aggregate-prompt.st">
-You are an expert at synthesizing information and combining partial solutions into comprehensive answers.
-
-Your task is to aggregate the solutions to sub-problems into a unified, coherent answer to the original problem.
-
-{context}
-CONTEXT:
-{contextValue}
-
-{/context}
-ORIGINAL PROBLEM:
-{originalProblem}
-
-SUB-PROBLEMS AND THEIR SOLUTIONS:
-
-{subProblemsAndSolutions}
-Sub-problem {index}: {subProblem}
-Solution {index}: {solution}
-
----
-{/subProblemsAndSolutions}
-
-AGGREGATION GUIDELINES:
-
-1. SYNTHESIS STRATEGY:
-   - Understand how each solution contributes to the overall answer
-   - Identify connections and relationships between solutions
-   - Recognize any dependencies or ordering requirements
-   - Determine how to best combine the information
-
-2. INTEGRATION PROCESS:
-   - Merge solutions in a logical, coherent manner
-   - Resolve any conflicts or inconsistencies between solutions
-   - Fill in gaps between sub-solutions
-   - Ensure smooth transitions and flow
-
-3. COMPLETENESS CHECK:
-   - Verify that the aggregated answer fully addresses the original problem
-   - Ensure no important aspects from sub-solutions are lost
-   - Check that the combined solution is greater than the sum of parts
-   - Validate that all parts of the original question are answered
-
-4. QUALITY ENHANCEMENT:
-   - Eliminate redundancy across sub-solutions
-   - Strengthen connections between related points
-   - Add integrative insights that emerge from combining solutions
-   - Ensure clarity and coherence in the final answer
-
-5. VALIDATION:
-   - Does the final answer directly address the original problem?
-   - Is it more comprehensive than any individual sub-solution?
-   - Does it maintain accuracy from all sub-solutions?
-   - Is it clear, coherent, and well-structured?
-
-OUTPUT FORMAT:
-Respond with a valid JSON object in this exact format:
-
-{
-  "finalAnswer": "Your comprehensive, synthesized answer to the original problem. This should be a complete, coherent response that integrates all sub-solutions while directly addressing the original question. Make it clear, well-structured, and actionable.",
-  "reasoning": "Explain your synthesis process: how you combined the sub-solutions, what connections you made, how conflicts were resolved, and why this aggregation effectively answers the original problem.",
-  "integrationStrategy": "Brief description of the approach you used to combine the solutions (e.g., sequential, hierarchical, parallel synthesis)",
-  "keyInsights": [
-    "Important insights that emerged from combining the solutions",
-    "Patterns or themes across sub-solutions",
-    "Additional value created through synthesis"
-  ],
-  "completenessCheck": {
-    "allSubProblemsAddressed": true or false,
-    "originalProblemFullySolved": true or false,
-    "notesOnGaps": "Any gaps or limitations in the final answer (if applicable)"
-  }
-}
-
-SYNTHESIS BEST PRACTICES:
-- Start with an overview that sets context for the integrated answer
-- Present information in a logical order that serves the original problem
-- Make explicit connections between related concepts from different sub-solutions
-- Don't just concatenate - truly synthesize and add integrative value
-- Maintain the depth and detail from sub-solutions while improving clarity
-- End with a clear conclusion or summary if appropriate
-
-COMMON PITFALLS TO AVOID:
-- Simple concatenation without integration
-- Losing important details from sub-solutions
-- Creating contradictions between parts
-- Failing to address the original problem directly
-- Making the answer less clear than individual sub-solutions
-
-Remember: Your goal is to create a unified answer that is MORE valuable than reading the sub-solutions separately. Add integrative value through your synthesis.
-</file>
-
-<file path="src/main/resources/prompts/decompose-prompt-springai.st">
-You are an expert problem-solving AI that specializes in recursive problem decomposition.
-
-Your task is to analyze the given problem and determine whether it needs to be broken down into smaller sub-problems or can be solved directly.
-
-{{#hasContext}}
-Context: {{context}}
-
-{{/hasContext}}
-PROBLEM TO ANALYZE:
-{{problem}}
-
-ANALYSIS GUIDELINES:
-
-1. DECOMPOSITION CRITERIA:
-   - The problem is complex and has multiple distinct aspects
-   - Breaking it down would make it easier to solve
-   - Sub-problems can be solved independently
-   - Solutions can be meaningfully combined
-
-2. BASE CASE CRITERIA (DO NOT DECOMPOSE IF):
-   - The problem is already simple and straightforward
-   - It requires a single, direct answer
-   - Further decomposition would be counterproductive
-   - The problem is already atomic in nature
-
-3. IF DECOMPOSING:
-   - Create UP TO {{maxBranching}} sub-problems (can be fewer if appropriate)
-   - Each sub-problem should be simpler and independent
-   - Ensure completeness: solving all sub-problems should solve the original
-
-OUTPUT FORMAT (JSON):
-{
-  "needsDecomposition": boolean,
-  "reasoning": "Clear explanation of your decision",
-  "subProblems": ["First sub-problem", "Second sub-problem", ...],
-  "decompositionStrategy": "Brief description of combination strategy"
-}
-</file>
-
-<file path="src/main/resources/prompts/decompose-prompt.st">
-You are an expert problem-solving AI that specializes in recursive problem decomposition.
-
-Your task is to analyze the given problem and determine whether it needs to be broken down into smaller sub-problems or can be solved directly.
-
-{context}
-Context: {contextValue}
-{/context}
-
-PROBLEM TO ANALYZE:
-{problem}
-
-ANALYSIS GUIDELINES:
-
-1. DECOMPOSITION CRITERIA:
-   - The problem is complex and has multiple distinct aspects
-   - Breaking it down would make it easier to solve
-   - Sub-problems can be solved independently
-   - Solutions can be meaningfully combined
-
-2. BASE CASE CRITERIA (DO NOT DECOMPOSE IF):
-   - The problem is already simple and straightforward
-   - It requires a single, direct answer
-   - Further decomposition would be counterproductive
-   - The problem is already atomic in nature
-
-3. IF DECOMPOSING:
-   - Create UP TO {maxBranching} sub-problems (can be fewer if appropriate)
-   - Each sub-problem should be:
-     * Simpler than the original problem
-     * Independent and self-contained
-     * Solvable without external dependencies
-     * Relevant to solving the original problem
-   - Ensure completeness: solving all sub-problems should solve the original
-   - Avoid overlap between sub-problems
-
-4. QUALITY CHECKS:
-   - Are the sub-problems actually simpler?
-   - Can they be solved independently?
-   - Will combining their solutions answer the original question?
-   - Have you avoided creating circular dependencies?
-
-OUTPUT FORMAT:
-Respond with a valid JSON object in this exact format:
-
-{
-  "needsDecomposition": true or false,
-  "reasoning": "Clear explanation of your decision. If decomposing, explain the strategy. If not, explain why it's a base case.",
-  "subProblems": [
-    "First sub-problem (clear, specific, self-contained)",
-    "Second sub-problem (clear, specific, self-contained)",
-    "Additional sub-problems as needed (up to {maxBranching})"
-  ],
-  "decompositionStrategy": "Brief description of how sub-problem solutions will be combined"
-}
-
-IMPORTANT NOTES:
-- If needsDecomposition is false, you can omit the "subProblems" array or provide an empty array
-- Each sub-problem should be a complete, well-formed question or task
-- Be strategic: sometimes fewer sub-problems are better
-- Prioritize clarity and independence in sub-problems
-
-Think carefully before responding. Your decomposition strategy will determine the quality of the final solution.
-</file>
-
-<file path="src/main/resources/prompts/solve-prompt-springai.st">
-
-</file>
-
-<file path="src/main/resources/prompts/solve-prompt.st">
-You are an expert problem solver with deep analytical capabilities.
-
-Your task is to solve the following problem directly and comprehensively.
-
-{context}
-CONTEXT:
-{contextValue}
-
-{/context}
-PROBLEM TO SOLVE:
-{problem}
-
-SOLVING GUIDELINES:
-
-1. UNDERSTANDING:
-   - Carefully read and understand what is being asked
-   - Identify key requirements and constraints
-   - Note any assumptions you need to make
-
-2. ANALYSIS:
-   - Break down the problem into logical components
-   - Consider different approaches or perspectives
-   - Identify the most effective solution method
-
-3. SOLUTION DEVELOPMENT:
-   - Provide a clear, specific, and actionable answer
-   - Support your solution with reasoning
-   - Include relevant details, examples, or calculations
-   - Address all aspects of the problem
-
-4. QUALITY ASSURANCE:
-   - Verify your solution is complete
-   - Check for logical consistency
-   - Ensure it directly addresses the problem
-   - Validate any calculations or assumptions
-
-5. CONFIDENCE ASSESSMENT:
-   - Rate your confidence based on:
-     * Clarity of the problem statement
-     * Availability of necessary information
-     * Complexity and ambiguity
-     * Your certainty in the solution approach
-
-OUTPUT FORMAT:
-Respond with a valid JSON object in this exact format:
-
-{
-  "solution": "Your comprehensive solution to the problem. Be specific, clear, and thorough. Include all relevant details and explanations.",
-  "reasoning": "Step-by-step explanation of how you arrived at this solution. Include your thought process, any calculations, considerations, and why you chose this approach.",
-  "confidence": 0.85,
-  "assumptions": [
-    "Any assumptions you made (if applicable)",
-    "Additional assumption (if applicable)"
-  ],
-  "considerations": [
-    "Important factors or edge cases to consider",
-    "Alternative approaches or trade-offs"
-  ]
-}
-
-CONFIDENCE SCALE:
-- 0.9-1.0: Highly confident, problem is clear and solution is well-established
-- 0.7-0.9: Confident, solution is solid with minor uncertainties
-- 0.5-0.7: Moderate confidence, some ambiguity or assumptions required
-- 0.3-0.5: Low confidence, significant uncertainty or missing information
-- 0.0-0.3: Very uncertain, problem may be ill-defined or unsolvable as stated
-
-IMPORTANT NOTES:
-- Provide actionable, specific answers, not vague generalizations
-- If the problem cannot be fully solved with given information, state what's missing
-- If multiple valid solutions exist, explain and choose the most appropriate
-- Be honest about limitations or uncertainties
-
-Focus on delivering a high-quality, complete solution that directly addresses the problem.
-</file>
-
-<file path="src/main/resources/application-test.yml">
-spring:
-  ai:
-    openai:
-      api-key: test-key-for-testing
-      
-rlm:
-  max-depth: 2
-  max-branching: 2
-
-# Template configuration
-prompt:
-  template:
-    cache:
-      enabled: true
-      ttl: 3600
-</file>
-
-<file path="src/main/resources/application.properties">
-spring.application.name=spring-ai-rlm
-
-spring.ai.openai.api-key=${OPENAI_API_KEY}
-spring.ai.openai.chat.options.model=gpt-4
-spring.ai.openai.chat.options.temperature=0.7
-spring.ai.openai.chat.options.max-tokens=2000
-
-spring.cache.type=caffeine
-spring.cache.caffeine.spec=maximumSize=100,expireAfterWrite=3600s
-
-server.port=8080
-
-# RLM Configuration
-rlm.max-depth=3
-rlm.max-branching=3
-rlm.timeout-seconds=30
-rlm.enable-caching=true
-rlm.decomposition-temperature=0.8
-rlm.solving-temperature=0.7
-rlm.aggregation-temperature=0.6
-
-logging.level.com.example.rlm=DEBUG
-logging.level.org.springframework.ai=INFO
-logging.pattern.console=%d{yyyy-MM-dd HH:mm:ss} - %msg%n
-
-
-spring.ai.chat.client.enabled=false
-# spring.ai.model.chat=google-genai
-# spring.ai.model.chat=anthropic
-# spring.ai.model.chat=openai
-# spring.ai.model.chat=none
-
-# --- Google Gemini Configuration ---
-spring.ai.google.genai.api-key=${GEMINI_API_KEY:your-api-key-here}
-spring.ai.google.genai.chat.options.model=gemini-3-pro-preview
-# spring.ai.google.genai.chat.options.model=gemma-3-27b-it
-# spring.ai.google.genai.chat.options.model=gemini-2.5-flash
-spring.ai.google.genai.enabled=false
-# spring.ai.google.genai.chat.options.temperature=0.1
-spring.ai.google.genai.chat.options.response-mime-type=text/plain
-# spring.ai.google.genai.chat.options.top-k=40
-# spring.ai.google.genai.chat.options.top-p=0.95
-# spring.ai.google.genai.chat.options.candidate-count=1
-# spring.ai.google.genai.chat.options.thinking-budget
-spring.ai.google.genai.chat.enable-cached-content=false
-
-# Disable audio/speech and transcription auto-configs to avoid requiring OpenAI keys in tests
-spring.ai.model.audio.speech=none
-spring.ai.model.audio.transcription=none
-# Disable other model types to prevent OpenAI auto-config from requiring keys in tests
-spring.ai.model.embedding=none
-spring.ai.model.image=none
-spring.ai.model.rerank=none
-
-#Antropic
-spring.ai.anthropic.chat.options.model=claude-opus-4-5
-#spring.ai.anthropic.chat.options.model=claude-opus-4-5
-# spring.ai.anthropic.chat.options.temperature=0.1
-spring.ai.anthropic.api-key=${ANTHROPIC_API_KEY:your-api-key-here}
-spring.ai.anthropic.enabled=true
-# spring.ai.anthropic.genai.chat.options.top-p=0.9
-spring.ai.anthropic.chat.options.max-tokens=40000
-
-
-
-#OpenaAI
-spring.ai.openai.chat.options.model=gpt-5.2
-#spring.ai.openai.chat.options.model=gpt-4
-spring.ai.openai.chat.options.temperature=1
-spring.ai.openai.api-key=${OPENAI_API_KEY:your-api-key-here}
-spring.ai.openai.enabled=false
-# spring.ai.openai.genai.chat.options.top-p=0.9
-# spring.ai.openai.chat.options.responseFormat=text
-# spring.ai.openai.chat.options.temperature=0.1
-</file>
-
-<file path="src/main/resources/application.yml">
-spring:
-  application:
-    name: spring-ai-rlm
-  
-  ai:
-    openai:
-      api-key: ${OPENAI_API_KEY}
-      chat:
-        options:
-          model: gpt-4
-          temperature: 0.7
-          max-tokens: 2000
-  
-  cache:
-    type: caffeine
-    caffeine:
-      spec: maximumSize=100,expireAfterWrite=3600s
-
-server:
-  port: 8080
-
-# RLM Configuration
-rlm:
-  max-depth: 3
-  max-branching: 3
-  timeout-seconds: 30
-  enable-caching: true
-  decomposition-temperature: 0.8
-  solving-temperature: 0.7
-  aggregation-temperature: 0.6
-
-logging:
-  level:
-    com.example.rlm: DEBUG
-    org.springframework.ai: INFO
-  pattern:
-    console: "%d{yyyy-MM-dd HH:mm:ss} - %msg%n"
-</file>
-
-<file path="src/test/java/com/example/rlm/PromptTemplateServiceTest.java">
-package com.example.rlm;
-
-import org.junit.jupiter.api.Test;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.context.SpringBootTest;
-
-import com.oracle.rlm.service.PromptTemplateService;
-
-import java.util.Arrays;
-import java.util.List;
-
-import static org.junit.jupiter.api.Assertions.*;
-
-@SpringBootTest
-class PromptTemplateServiceTest {
-    
-    @Autowired
-    private PromptTemplateService promptTemplateService;
-    
-    @Test
-    void testDecomposePromptCreation() {
-        String prompt = promptTemplateService.createDecomposePrompt(
-            "What is the meaning of life?",
-            "Philosophy context",
-            3
-        );
-        
-        assertNotNull(prompt);
-        assertTrue(prompt.contains("What is the meaning of life?"));
-        assertTrue(prompt.contains("3"));
-        assertTrue(prompt.contains("Philosophy context"));
-    }
-    
-    @Test
-    void testSolvePromptCreation() {
-        String prompt = promptTemplateService.createSolvePrompt(
-            "Calculate 2+2",
-            null
-        );
-        
-        assertNotNull(prompt);
-        assertTrue(prompt.contains("Calculate 2+2"));
-        assertFalse(prompt.contains("{context}"));
-    }
-    
-    @Test
-    void testAggregatePromptCreation() {
-        List<String> subProblems = Arrays.asList(
-            "Sub-problem 1",
-            "Sub-problem 2"
-        );
-        List<String> solutions = Arrays.asList(
-            "Solution 1",
-            "Solution 2"
-        );
-        
-        String prompt = promptTemplateService.createAggregatePrompt(
-            "Original problem",
-            subProblems,
-            solutions,
-            "Test context"
-        );
-        
-        assertNotNull(prompt);
-        assertTrue(prompt.contains("Original problem"));
-        assertTrue(prompt.contains("Sub-problem 1"));
-        assertTrue(prompt.contains("Solution 1"));
-    }
-}
-</file>
-
-<file path="src/test/java/com/example/rlm/RlmServiceTest.java">
-package com.example.rlm;
-
-import com.oracle.rlm.model.RlmRequest;
-import com.oracle.rlm.model.RlmResponse;
-import com.oracle.rlm.service.RlmService;
-import org.junit.jupiter.api.Test;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.test.context.TestPropertySource;
-
-import static org.junit.jupiter.api.Assertions.*;
-
-@SpringBootTest
-@TestPropertySource(properties = {
-    "spring.ai.openai.api-key=test-key"
-})
-class RlmServiceTest {
-    
-    @Autowired(required = false)
-    private RlmService rlmService;
-    
-    @Test
-    void testContextLoads() {
-        // Test that Spring context loads successfully
-        assertNotNull(rlmService);
-    }
-    
-    @Test
-    void testRlmRequestBuilder() {
-        RlmRequest request = RlmRequest.builder()
-            .problem("What is 2+2?")
-            .maxDepth(2)
-            .maxBranching(2)
-            .strategy("depth-first")
-            .verbose(true)
-            .build();
-        
-        assertNotNull(request);
-        assertEquals("What is 2+2?", request.getProblem());
-        assertEquals(2, request.getMaxDepth());
-        assertEquals(2, request.getMaxBranching());
-    }
-}
-</file>
-
-<file path="src/docker-compose.yml">
-version: '3.8'
-
-services:
-  spring-ai-rlm:
-    build: .
-    ports:
-      - "8080:8080"
-    environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - SPRING_PROFILES_ACTIVE=prod
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/api/v1/rlm/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-</file>
-
-<file path="src/Dockerfile">
-FROM eclipse-temurin:17-jdk-alpine AS build
-WORKDIR /workspace/app
-
-COPY mvnw .
-COPY .mvn .mvn
-COPY pom.xml .
-COPY src src
-
-RUN ./mvnw install -DskipTests
-RUN mkdir -p target/dependency && (cd target/dependency; jar -xf ../*.jar)
-
-FROM eclipse-temurin:17-jre-alpine
-VOLUME /tmp
-ARG DEPENDENCY=/workspace/app/target/dependency
-COPY --from=build ${DEPENDENCY}/BOOT-INF/lib /app/lib
-COPY --from=build ${DEPENDENCY}/META-INF /app/META-INF
-COPY --from=build ${DEPENDENCY}/BOOT-INF/classes /app
-
-ENTRYPOINT ["java","-cp","app:app/lib/*","com.example.rlm.SpringAiRlmApplication"]
-</file>
-
-<file path="src/README.md">
-# Spring AI Recursive Language Models (RLMs)
-
-A production-ready microservice implementing Recursive Language Models using Spring AI framework.
-
-## Features
-
-- 🔄 Recursive problem decomposition and solving
-- 🎯 Multiple recursion strategies (Depth-First, Breadth-First)
-- 💾 Caching support for improved performance
-- 📊 Detailed thought process tracking
-- 🔧 Configurable recursion depth and branching
-- 🚀 RESTful API
-- 📝 Comprehensive logging
-- 🐳 Docker support
-
-## Prerequisites
-
-- Java 17 or higher
-- Maven 3.6+
-- OpenAI API Key
-- Docker (optional)
-
-## Installation
-
-1. Clone the repository
-2. Set your OpenAI API key:
-   ```bash
-   export OPENAI_API_KEY=your-api-key-here
-
-## example usage
-
-```bash  
-curl -X POST http://localhost:8080/api/v1/rlm/solve \
-  -H "Content-Type: application/json" \
-  -d '{
-    "problem": "Calculate the sum of all prime numbers between 1 and 100",
-    "maxDepth": 3,
-    "maxBranching": 3,
-    "strategy": "depth-first",
-    "verbose": true
-  }'
-
-  curl -X POST http://localhost:8080/api/v1/rlm/solve \
-  -H "Content-Type: application/json" \
-  -d '{
-    "problem": "Design a scalable microservices architecture for an e-commerce platform that handles 1 million users",
-    "maxDepth": 4,
-    "maxBranching": 4,
-    "strategy": "depth-first",
-    "verbose": true,
-    "context": "The platform needs to support product catalog, user management, orders, and payments"
-  }'
-
-  curl -X POST http://localhost:8080/api/v1/rlm/solve \
-  -H "Content-Type: application/json" \
-  -d '{
-    "problem": "Plan a 7-day trip to Japan covering Tokyo, Kyoto, and Osaka with a budget of $3000",
-    "maxDepth": 3,
-    "maxBranching": 3,
-    "strategy": "breadth-first",
-    "verbose": false
-  }'
 </file>
 
 </files>

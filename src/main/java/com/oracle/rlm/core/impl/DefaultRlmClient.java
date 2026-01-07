@@ -1,16 +1,13 @@
 package com.oracle.rlm.core.impl;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.oracle.rlm.config.RlmConfig;
-import com.oracle.rlm.core.RlmClient;
-import com.oracle.rlm.core.RlmCompletionRequest;
-import com.oracle.rlm.core.RlmCompletionResult;
-import com.oracle.rlm.core.RlmEnvironmentStore;
-import com.oracle.rlm.model.RecursionStep;
-import com.oracle.rlm.model.ThoughtProcess;
-import com.oracle.rlm.service.RecursiveThinkingService;
-import com.oracle.rlm.strategy.RecursionStrategy;
+import com.oracle.rlm.core.*;
+import com.oracle.rlm.service.RlmPromptService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
@@ -22,151 +19,205 @@ import java.util.*;
 @Slf4j
 public class DefaultRlmClient implements RlmClient {
 
-    private final RecursiveThinkingService recursiveThinkingService;
-    private final RlmConfig rlmConfig;
-    private final Map<String, RecursionStrategy> recursionStrategies;
+    private final ChatClient.Builder chatClientBuilder;
+    private volatile ChatClient chatClient;
+    private final RlmPromptService promptService;
     private final RlmEnvironmentStore environmentStore;
+    private final RlmConfig rlmConfig;
+    private final ObjectMapper objectMapper = new ObjectMapper();
 
     @Override
     public RlmCompletionResult completion(RlmCompletionRequest request) {
         Instant start = Instant.now();
-
-        String strategyName = request.getStrategy() != null
-                ? request.getStrategy()
-                : "depth-first";
-        RecursionStrategy strategy = resolveStrategy(strategyName);
-
-        int maxDepth = Optional.ofNullable(request.getMaxDepth())
-                .orElse(rlmConfig.getMaxDepth());
-        int maxBranching = Optional.ofNullable(request.getMaxBranching())
-                .orElse(rlmConfig.getMaxBranching());
-
-        // Construct context: inlineContext + environment “view”
-        String combinedContext = buildContext(request);
-
-        RecursionStep root = strategy.execute(
-                request.getQuery(),
-                combinedContext,
-                maxDepth,
-                maxBranching
-        );
-
-        List<ThoughtProcess> thoughts = request.isVerbose()
-                ? extractThoughtProcesses(root)
-                : Collections.emptyList();
-
-        Duration processingTime = Duration.between(start, Instant.now());
-
-        Map<String, Object> metadata = new HashMap<>();
-        metadata.put("strategy", strategyName);
-        metadata.put("maxDepth", maxDepth);
-        metadata.put("maxBranching", maxBranching);
-        metadata.put("environmentId", request.getEnvironmentId());
-
-        return RlmCompletionResult.builder()
-                .finalAnswer(root.getResult())
-                .rawOutput(null) // you can pass raw LLM output if you capture it
-                .totalSteps(countTotalSteps(root))
-                .maxDepthReached(findMaxDepth(root))
-                .processingTime(processingTime)
-                .startedAt(start)
-                .strategy(strategyName)
-                .thoughtProcesses(thoughts)
-                .metadata(metadata)
-                .build();
-    }
-
-    private RecursionStrategy resolveStrategy(String strategyName) {
-        String beanName;
-        if (strategyName == null || strategyName.isBlank()) {
-            beanName = "depthFirstRecursion";
-        } else {
-            switch (strategyName.toLowerCase()) {
-                case "depth-first":
-                case "depthfirst":
-                case "depth_first":
-                    beanName = "depthFirstRecursion";
-                    break;
-                case "breadth-first":
-                case "breadthfirst":
-                case "breadth_first":
-                    beanName = "breadthFirstRecursion";
-                    break;
-                default:
-                    beanName = strategyName + "Recursion";
+        
+        if (this.chatClient == null) {
+            synchronized (this) {
+                if (this.chatClient == null) {
+                    this.chatClient = chatClientBuilder
+                            .defaultSystem(promptService.createSystemPrompt())
+                            .build();
+                }
             }
         }
 
-        RecursionStrategy strategy = recursionStrategies.get(beanName);
-        if (strategy == null) {
-            log.warn("Strategy {} not found, falling back to depth-first", strategyName);
-            strategy = recursionStrategies.get("depthFirstRecursion");
+        // Get or create environment
+        RlmEnvironment env = getOrCreateEnvironment(request);
+        
+        // Setup initial context
+        if (request.getInlineContext() != null) {
+            env.putContextChunk("initial_context", request.getInlineContext());
         }
-        return strategy;
+
+        int maxSteps = request.getMaxDepth() != null ? request.getMaxDepth() * 10 : 30;
+        int step = 0;
+        boolean finished = false;
+        String finalAnswer = null;
+
+        try {
+            while (!finished && step < maxSteps) {
+                step++;
+                log.info("RLM Step {}/{}", step, maxSteps);
+
+                // Build prompt with history
+                String userPrompt = promptService.createUserPrompt(
+                        request.getQuery(),
+                        env.getHistory(),
+                        env.getEnvironmentInfo()
+                );
+
+                // Get model response
+                String response = chatClient.prompt()
+                        .user(userPrompt)
+                        .call()
+                        .content();
+
+                // Parse response
+                StepResponse stepResponse = parseStepResponse(response);
+
+                if (stepResponse.finished) {
+                    finished = true;
+                    finalAnswer = stepResponse.answer;
+                    log.info("RLM finished at step {}", step);
+                    break;
+                }
+
+                // Execute tool
+                ToolCall toolCall = ToolCall.builder()
+                        .toolName(stepResponse.tool)
+                        .code(stepResponse.code)
+                        .reasoning(stepResponse.thought)
+                        .build();
+
+                ToolResult result = executeTool(env, toolCall);
+
+                // Record observation
+                ActionObservation observation = ActionObservation.builder()
+                        .step(step)
+                        .thought(stepResponse.thought)
+                        .action(toolCall)
+                        .observation(result)
+                        .timestamp(System.currentTimeMillis())
+                        .build();
+
+                env.addObservation(observation);
+
+                if (!result.isSuccess()) {
+                    log.warn("Tool execution failed at step {}: {}", step, result.getError());
+                }
+            }
+
+            if (!finished) {
+                log.warn("RLM reached max steps ({}) without finishing", maxSteps);
+                finalAnswer = "Maximum steps reached without complete solution. " +
+                             "Last observations: " + summarizeHistory(env.getHistory(), 3);
+            }
+
+            Duration processingTime = Duration.between(start, Instant.now());
+
+            return RlmCompletionResult.builder()
+                    .finalAnswer(finalAnswer)
+                    .totalSteps(step)
+                    .maxDepthReached(step)
+                    .processingTime(processingTime)
+                    .startedAt(start)
+                    .strategy("rlm-action-loop")
+                    .thoughtProcesses(request.isVerbose() ? 
+                        convertToThoughtProcesses(env.getHistory()) : null)
+                    .metadata(Map.of(
+                            "environmentId", env.getId(),
+                            "totalObservations", env.getHistory().size(),
+                            "workingDir", env.getCurrentWorkingDirectory()
+                    ))
+                    .build();
+
+        } catch (Exception e) {
+            log.error("RLM execution failed", e);
+            throw new RuntimeException("RLM execution failed: " + e.getMessage(), e);
+        }
     }
 
-    private String buildContext(RlmCompletionRequest request) {
-        StringBuilder ctx = new StringBuilder();
-
-        if (request.getInlineContext() != null && !request.getInlineContext().isBlank()) {
-            ctx.append("INLINE CONTEXT:\n")
-               .append(request.getInlineContext())
-               .append("\n\n");
-        }
-
+    private RlmEnvironment getOrCreateEnvironment(RlmCompletionRequest request) {
         if (request.getEnvironmentId() != null) {
-            environmentStore.getEnvironment(request.getEnvironmentId())
-                    .ifPresent(env -> {
-                        ctx.append("ENVIRONMENT LABEL: ").append(env.getLabel()).append("\n");
-                        // You can design a smarter dump here:
-                        ctx.append("ENVIRONMENT SUMMARY (search(\"*\")):\n")
-                           .append(env.search("")); // naive: return some summary
-                    });
+            return environmentStore.getEnvironment(request.getEnvironmentId())
+                    .orElseGet(() -> environmentStore.createEnvironment("auto-created"));
         }
-
-        return ctx.length() > 0 ? ctx.toString() : null;
+        return environmentStore.createEnvironment("request-" + UUID.randomUUID());
     }
 
-    private int countTotalSteps(RecursionStep step) {
-        int count = 1;
-        for (RecursionStep sub : step.getSubSteps()) {
-            count += countTotalSteps(sub);
+    private StepResponse parseStepResponse(String response) {
+        try {
+            JsonNode node = objectMapper.readTree(response);
+            
+            StepResponse sr = new StepResponse();
+            sr.thought = node.has("thought") ? node.get("thought").asText() : "";
+            sr.finished = node.has("finished") && node.get("finished").asBoolean();
+            
+            if (sr.finished) {
+                sr.answer = node.has("answer") ? node.get("answer").asText() : "";
+            } else {
+                sr.tool = node.has("tool") ? node.get("tool").asText() : "python";
+                sr.code = node.has("code") ? node.get("code").asText() : "";
+            }
+            
+            return sr;
+        } catch (Exception e) {
+            log.error("Failed to parse step response: {}", response, e);
+            // Fallback
+            StepResponse sr = new StepResponse();
+            sr.thought = "Parse error";
+            sr.finished = true;
+            sr.answer = response;
+            return sr;
         }
-        return count;
     }
 
-    private int findMaxDepth(RecursionStep step) {
-        int max = step.getDepth();
-        for (RecursionStep sub : step.getSubSteps()) {
-            max = Math.max(max, findMaxDepth(sub));
-        }
-        return max;
+    private ToolResult executeTool(RlmEnvironment env, ToolCall toolCall) {
+        return switch (toolCall.getToolName().toLowerCase()) {
+            case "python" -> env.executePython(toolCall.getCode());
+            case "bash" -> env.executeBash(toolCall.getCode());
+            case "write_file" -> {
+                String[] parts = toolCall.getCode().split("\n", 2);
+                yield env.writeFile(parts[0], parts.length > 1 ? parts[1] : "");
+            }
+            case "read_file" -> env.readFile(toolCall.getCode());
+            case "search" -> ToolResult.builder()
+                    .success(true)
+                    .output(env.search(toolCall.getCode()))
+                    .build();
+            default -> ToolResult.builder()
+                    .success(false)
+                    .error("Unknown tool: " + toolCall.getToolName())
+                    .build();
+        };
     }
 
-    private List<ThoughtProcess> extractThoughtProcesses(RecursionStep root) {
-        List<ThoughtProcess> processes = new ArrayList<>();
-        extractRecursive(root, processes);
-        return processes;
+    private String summarizeHistory(List<ActionObservation> history, int last) {
+        return history.stream()
+                .skip(Math.max(0, history.size() - last))
+                .map(obs -> String.format("Step %d: %s -> %s",
+                        obs.getStep(),
+                        obs.getAction().getToolName(),
+                        obs.getObservation().isSuccess() ? "success" : "failed"))
+                .reduce("", (a, b) -> a + "\n" + b);
     }
 
-    private void extractRecursive(RecursionStep step, List<ThoughtProcess> processes) {
-        ThoughtProcess process = ThoughtProcess.builder()
-                .level(step.getDepth())
-                .description(step.getProblem())
-                .build();
+    private List<com.oracle.rlm.model.ThoughtProcess> convertToThoughtProcesses(
+            List<ActionObservation> history) {
+        // Convert observations to ThoughtProcess for compatibility
+        return history.stream()
+                .map(obs -> com.oracle.rlm.model.ThoughtProcess.builder()
+                        .level(obs.getStep())
+                        .description(obs.getThought())
+                        .synthesis(obs.getObservation().getOutput())
+                        .build())
+                .toList();
+    }
 
-        if ("decompose".equals(step.getAction())) {
-            step.getSubSteps().forEach(sub -> {
-                process.getSubProblems().add(sub.getProblem());
-                process.getSolutions().add(sub.getResult());
-            });
-            process.setSynthesis(step.getResult());
-        } else if ("solve".equals(step.getAction())) {
-            process.setSynthesis(step.getResult());
-        }
-
-        processes.add(process);
-
-        step.getSubSteps().forEach(sub -> extractRecursive(sub, processes));
+    private static class StepResponse {
+        String thought;
+        String tool;
+        String code;
+        boolean finished;
+        String answer;
     }
 }

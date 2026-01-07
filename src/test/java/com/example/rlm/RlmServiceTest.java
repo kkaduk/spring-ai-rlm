@@ -6,11 +6,12 @@ import com.oracle.rlm.service.RlmService;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import com.oracle.rlm.SpringAiRlmApplication;
 import org.springframework.test.context.TestPropertySource;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-@SpringBootTest
+@SpringBootTest(classes = SpringAiRlmApplication.class)
 @TestPropertySource(properties = {
     "spring.ai.openai.api-key=test-key"
 })

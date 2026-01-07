@@ -3,15 +3,20 @@ package com.example.rlm;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.test.context.TestPropertySource;
 
 import com.oracle.rlm.service.PromptTemplateService;
+import com.oracle.rlm.SpringAiRlmApplication;
 
 import java.util.Arrays;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-@SpringBootTest
+@SpringBootTest(classes = SpringAiRlmApplication.class)
+@TestPropertySource(properties = {
+    "spring.ai.openai.api-key=test-key"
+})
 class PromptTemplateServiceTest {
     
     @Autowired

@@ -1,5 +1,7 @@
 package com.oracle.rlm.core;
 
+import java.util.List;
+
 /**
  * Represents a logical environment in which an RLM call runs.
  * It can hold arbitrarily large context outside the model’s prompt window.
@@ -30,8 +32,24 @@ public interface RlmEnvironment {
      * Optional search API – lets the model “ask” to search the environment.
      * In real RLM, this would be invoked via tool-calls / code in a REPL.
      */
-    default String search(String query) {
-        // no-op or simple implementation; can be enhanced later
-        return "";
-    }
+    // default String search(String query) {
+    //     // no-op or simple implementation; can be enhanced later
+    //     return "";
+    // }
+
+    // NEW: Tool execution capabilities
+    ToolResult executePython(String code);
+    ToolResult executeBash(String command);
+    ToolResult writeFile(String filename, String content);
+    ToolResult readFile(String filename);
+    String search(String query);
+    
+    // NEW: Observation history for the model
+    List<ActionObservation> getHistory();
+    void addObservation(ActionObservation observation);
+    
+    // NEW: Environment state
+    String getCurrentWorkingDirectory();
+    List<String> listFiles();
+    String getEnvironmentInfo();
 }

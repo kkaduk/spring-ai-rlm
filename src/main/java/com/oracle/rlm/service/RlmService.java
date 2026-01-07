@@ -1,10 +1,11 @@
 package com.oracle.rlm.service;
 
 import com.oracle.rlm.config.RlmConfig;
-import com.oracle.rlm.model.*;
 import com.oracle.rlm.core.RlmClient;
 import com.oracle.rlm.core.RlmCompletionRequest;
 import com.oracle.rlm.core.RlmCompletionResult;
+import com.oracle.rlm.model.RlmRequest;
+import com.oracle.rlm.model.RlmResponse;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -19,46 +20,32 @@ public class RlmService {
     
     public RlmResponse processRequest(RlmRequest request) {
         long startTime = System.currentTimeMillis();
-        log.info("Processing RLM request via core client: {}", request.getProblem());
-
-        int maxDepth = request.getMaxDepth() != null ? request.getMaxDepth() : rlmConfig.getMaxDepth();
-        int maxBranching = request.getMaxBranching() != null ? request.getMaxBranching() : rlmConfig.getMaxBranching();
+        log.info("Processing RLM request: {}", request.getProblem());
 
         try {
             RlmCompletionRequest coreRequest = RlmCompletionRequest.builder()
                     .query(request.getProblem())
                     .inlineContext(request.getContext())
-                    .maxDepth(maxDepth)
-                    .maxBranching(maxBranching)
-                    .strategy(request.getStrategy())
+                    .maxDepth(request.getMaxDepth() != null ? 
+                        request.getMaxDepth() : rlmConfig.getMaxDepth())
                     .verbose(Boolean.TRUE.equals(request.getVerbose()))
                     .build();
 
             RlmCompletionResult result = rlmClient.completion(coreRequest);
 
-            RlmResponse response = RlmResponse.builder()
+            return RlmResponse.builder()
                     .problem(request.getProblem())
                     .finalAnswer(result.getFinalAnswer())
                     .thoughtProcesses(result.getThoughtProcesses())
                     .totalSteps(result.getTotalSteps())
                     .maxDepthReached(result.getMaxDepthReached())
-                    .processingTimeMs(result.getProcessingTime() != null
-                            ? result.getProcessingTime().toMillis()
-                            : (System.currentTimeMillis() - startTime))
-                    .strategy(result.getStrategy())
+                    .processingTimeMs(result.getProcessingTime().toMillis())
+                    .strategy("rlm-action-loop")
                     .build();
 
-            log.info("Completed RLM request via core in {}ms", response.getProcessingTimeMs());
-            return response;
-
         } catch (Exception e) {
-            log.error("Error processing RLM request via core: {}", e.getMessage(), e);
+            log.error("Error processing RLM request: {}", e.getMessage(), e);
             throw new RuntimeException("Failed to process RLM request: " + e.getMessage(), e);
         }
     }
-    
-    
-    
-    
-    
 }
