@@ -40,15 +40,25 @@ public class RlmPromptService {
             When you need to solve a sub-problem, use the rlm_call tool with the
             sub-query in the "code" field. Do not include the full context in the prompt.
             
-            Format your response as JSON:
+            IMPORTANT OUTPUT REQUIREMENTS:
+            - Respond ONLY with a single valid JSON object. 
+            - Do NOT include any prose, explanations, or code fences (no ```).
+            - The JSON must include these fields exactly when continuing:
+              { "thought": "...", "tool": "tool_name", "code": "code or command", "finished": false }
+            - When you are done, respond with:
+              { "thought": "summary", "tool": "finish", "answer": "final answer", "finished": true }
+            - Valid tool_name values: "python", "bash", "write_file", "read_file", "search", "rlm_call", "finish".
+            - Place any code/command to execute in the "code" field.
+
+            Example (continue):
             {
               "thought": "your reasoning about what to do next",
               "tool": "tool_name",
               "code": "code or command to execute",
               "finished": false
             }
-            
-            When you're done:
+
+            Example (finish):
             {
               "thought": "summary of solution",
               "tool": "finish",

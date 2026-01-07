@@ -87,29 +87,143 @@ public class DefaultRlmClient implements RlmClient {
 
     private StepResponse parseStepResponse(String response) {
         try {
-            JsonNode node = objectMapper.readTree(response);
-            
+            JsonNode node = tryExtractJsonNode(response);
+
             StepResponse sr = new StepResponse();
             sr.thought = node.has("thought") ? node.get("thought").asText() : "";
-            sr.finished = node.has("finished") && node.get("finished").asBoolean();
-            
+
+            // If the model signals finish via tool, infer finished = true even if missing
+            boolean finishedFlag = node.has("finished") && node.get("finished").asBoolean();
+            if (!finishedFlag && node.has("tool") && "finish".equalsIgnoreCase(node.get("tool").asText())) {
+                finishedFlag = true;
+            }
+            sr.finished = finishedFlag;
+
             if (sr.finished) {
-                sr.answer = node.has("answer") ? node.get("answer").asText() : "";
+                sr.answer = node.has("answer") ? node.get("answer").asText() : node.toString();
             } else {
                 sr.tool = node.has("tool") ? node.get("tool").asText() : "python";
                 sr.code = node.has("code") ? node.get("code").asText() : "";
+                if (sr.code == null) sr.code = "";
             }
-            
+
             return sr;
         } catch (Exception e) {
-            log.error("Failed to parse step response: {}", response, e);
-            // Fallback
+            // Non-JSON model output is common; handle quietly without stacktrace spam.
+            log.warn("Invalid step response (non-JSON). Applying fallback. Snippet: {}",
+                    abbreviate(response, 400));
+
+            // Heuristics fallback:
+            // 1) If there's a python/bash fenced block, execute it as the chosen tool.
+            // 2) Otherwise, nudge the model by executing a harmless echo via bash and continue.
             StepResponse sr = new StepResponse();
-            sr.thought = "Parse error";
-            sr.finished = true;
-            sr.answer = response;
+            sr.thought = "Model response was not valid JSON. Applying heuristic fallback.";
+
+            Optional<Map.Entry<String, String>> fenced = extractCodeFromFence(response);
+            if (fenced.isPresent()) {
+                Map.Entry<String, String> entry = fenced.get();
+                sr.tool = entry.getKey();
+                sr.code = entry.getValue();
+                sr.finished = false;
+            } else {
+                sr.tool = "bash";
+                sr.code = "echo 'Formatting error: Respond ONLY with JSON per the schema (no prose, no code fences).'";
+                sr.finished = false;
+            }
             return sr;
         }
+    }
+
+    // Try to extract a JSON object from the model response, supporting:
+    // - pure JSON
+    // - JSON inside ```json ...``` fences
+    // - largest plausible {...} substring
+    private JsonNode tryExtractJsonNode(String response) throws Exception {
+        String trimmed = response == null ? "" : response.trim();
+        if (!trimmed.isEmpty() && trimmed.charAt(0) == '{') {
+            return objectMapper.readTree(trimmed);
+        }
+
+        // Look for ```json ...``` fenced blocks
+        int fenceStart = trimmed.indexOf("```");
+        while (fenceStart != -1) {
+            int fenceEnd = trimmed.indexOf("```", fenceStart + 3);
+            if (fenceEnd == -1) break;
+
+            int headerEnd = trimmed.indexOf('\n', fenceStart + 3);
+            String header = "";
+            int contentStart;
+            if (headerEnd != -1 && headerEnd < fenceEnd) {
+                header = trimmed.substring(fenceStart + 3, headerEnd).trim().toLowerCase(Locale.ROOT);
+                contentStart = headerEnd + 1;
+            } else {
+                contentStart = fenceStart + 3;
+            }
+            String code = trimmed.substring(contentStart, fenceEnd).trim();
+            if (header.contains("json")) {
+                try {
+                    return objectMapper.readTree(code);
+                } catch (Exception ignore) {
+                    // try next fence
+                }
+            }
+            fenceStart = trimmed.indexOf("```", fenceEnd + 3);
+        }
+
+        // Heuristic: try the largest {...} slice that parses
+        int firstBrace = trimmed.indexOf('{');
+        int lastBrace = trimmed.lastIndexOf('}');
+        while (firstBrace != -1 && lastBrace != -1 && lastBrace >= firstBrace) {
+            String candidate = trimmed.substring(firstBrace, lastBrace + 1);
+            try {
+                return objectMapper.readTree(candidate);
+            } catch (Exception ignore) {
+                lastBrace = trimmed.lastIndexOf('}', lastBrace - 1);
+            }
+        }
+
+        throw new IllegalArgumentException("No JSON object found in response");
+    }
+
+    // Extract code from ```python ...``` or ```bash ...``` fences if present
+    private Optional<Map.Entry<String, String>> extractCodeFromFence(String response) {
+        if (response == null) return Optional.empty();
+        String s = response;
+
+        int idx = s.indexOf("```");
+        while (idx != -1) {
+            int end = s.indexOf("```", idx + 3);
+            if (end == -1) break;
+
+            int headerEnd = s.indexOf('\n', idx + 3);
+            String header = "";
+            int contentStart;
+            if (headerEnd != -1 && headerEnd < end) {
+                header = s.substring(idx + 3, headerEnd).trim().toLowerCase(Locale.ROOT);
+                contentStart = headerEnd + 1;
+            } else {
+                contentStart = idx + 3;
+            }
+            String code = s.substring(contentStart, end).trim();
+            String lang = header;
+
+            if (lang.contains("python")) {
+                return Optional.of(Map.entry("python", code));
+            } else if (lang.contains("bash") || lang.contains("sh")) {
+                return Optional.of(Map.entry("bash", code));
+            }
+
+            idx = s.indexOf("```", end + 3);
+        }
+
+        return Optional.empty();
+    }
+
+    // Abbreviate a potentially long string for logging purposes
+    private String abbreviate(String s, int maxLen) {
+        if (s == null) return "null";
+        if (maxLen <= 3) return s.length() <= maxLen ? s : s.substring(0, maxLen);
+        return s.length() <= maxLen ? s : (s.substring(0, maxLen - 3) + "...");
     }
 
     private ToolResult executeTool(RlmEnvironment env, ToolCall toolCall) {
