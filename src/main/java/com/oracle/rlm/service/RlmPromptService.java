@@ -22,6 +22,7 @@ public class RlmPromptService {
             - write_file: Write content to a file
             - read_file: Read content from a file
             - search: Search through available context
+            - rlm_call: Make a recursive RLM call with a sub-query
             - finish: Return the final answer
             
             For each step, you should:
@@ -31,6 +32,13 @@ public class RlmPromptService {
             4. Decide the next action based on the observation
             
             Continue this process until you have solved the problem, then use the 'finish' tool with your answer.
+
+            The full context is stored in the environment, available as:
+            - a file named "context.txt" in the working directory
+            - a Python variable CONTEXT (auto-loaded for python tool calls)
+
+            When you need to solve a sub-problem, use the rlm_call tool with the
+            sub-query in the "code" field. Do not include the full context in the prompt.
             
             Format your response as JSON:
             {
@@ -54,10 +62,17 @@ public class RlmPromptService {
      * Creates the user prompt with task and history.
      */
     public String createUserPrompt(String task, List<ActionObservation> history, 
-                                    String environmentInfo) {
+                                    String environmentInfo, int currentDepth,
+                                    int maxDepth, int maxBranching, int branchCallsSoFar) {
         StringBuilder prompt = new StringBuilder();
         
         prompt.append("TASK:\n").append(task).append("\n\n");
+        prompt.append("RECURSION:\n")
+              .append("currentDepth=").append(currentDepth)
+              .append(", maxDepth=").append(maxDepth)
+              .append(", maxBranching=").append(maxBranching)
+              .append(", branchingUsed=").append(branchCallsSoFar)
+              .append("\n\n");
         
         prompt.append("ENVIRONMENT:\n").append(environmentInfo).append("\n\n");
         

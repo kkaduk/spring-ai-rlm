@@ -29,6 +29,21 @@ public interface RlmEnvironment {
     void putContextChunk(String key, String value);
 
     /**
+     * Store the full context in the environment (e.g., as a file for REPL access).
+     */
+    void setFullContext(String context);
+
+    /**
+     * Retrieve the full context, if available.
+     */
+    String getFullContext();
+
+    /**
+     * Size of the full context in characters, or 0 if none.
+     */
+    long getContextSize();
+
+    /**
      * Optional search API – lets the model “ask” to search the environment.
      * In real RLM, this would be invoked via tool-calls / code in a REPL.
      */

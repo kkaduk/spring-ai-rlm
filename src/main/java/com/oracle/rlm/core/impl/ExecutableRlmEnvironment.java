@@ -10,6 +10,8 @@ import java.util.concurrent.*;
 
 @Slf4j
 public class ExecutableRlmEnvironment implements RlmEnvironment {
+
+    private static final String CONTEXT_FILENAME = "context.txt";
     
     private final String id;
     private final String label;
@@ -17,6 +19,8 @@ public class ExecutableRlmEnvironment implements RlmEnvironment {
     private final Map<String, String> chunks = new ConcurrentHashMap<>();
     private final List<ActionObservation> history = new ArrayList<>();
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    private Path contextPath;
+    private long contextSize;
     
     public ExecutableRlmEnvironment(String id, String label) {
         this.id = id;
@@ -47,6 +51,44 @@ public class ExecutableRlmEnvironment implements RlmEnvironment {
     public void putContextChunk(String key, String value) {
         chunks.put(key, value);
     }
+
+    @Override
+    public void setFullContext(String context) {
+        try {
+            if (context == null) {
+                contextSize = 0;
+                if (contextPath != null) {
+                    Files.deleteIfExists(contextPath);
+                }
+                contextPath = null;
+                return;
+            }
+            contextPath = workDir.resolve(CONTEXT_FILENAME);
+            Files.writeString(contextPath, context);
+            contextSize = context.length();
+        } catch (IOException e) {
+            log.error("Failed to store full context", e);
+            throw new RuntimeException("Failed to store full context", e);
+        }
+    }
+
+    @Override
+    public String getFullContext() {
+        if (contextPath == null || !Files.exists(contextPath)) {
+            return null;
+        }
+        try {
+            return Files.readString(contextPath);
+        } catch (IOException e) {
+            log.error("Failed to read full context", e);
+            return null;
+        }
+    }
+
+    @Override
+    public long getContextSize() {
+        return contextSize;
+    }
     
     @Override
     public ToolResult executePython(String code) {
@@ -54,7 +96,8 @@ public class ExecutableRlmEnvironment implements RlmEnvironment {
         try {
             // Write code to temp file
             Path scriptPath = workDir.resolve("script_" + System.nanoTime() + ".py");
-            Files.writeString(scriptPath, code);
+            String wrappedCode = buildPythonPrelude() + "\n" + code;
+            Files.writeString(scriptPath, wrappedCode);
             
             // Execute with timeout
             ProcessBuilder pb = new ProcessBuilder("python3", scriptPath.toString());
@@ -143,6 +186,10 @@ public class ExecutableRlmEnvironment implements RlmEnvironment {
         try {
             Path filePath = workDir.resolve(filename);
             Files.writeString(filePath, content);
+            if (CONTEXT_FILENAME.equals(filename)) {
+                contextPath = filePath;
+                contextSize = content != null ? content.length() : 0;
+            }
             return ToolResult.builder()
                 .success(true)
                 .output("File written: " + filename)
@@ -174,13 +221,30 @@ public class ExecutableRlmEnvironment implements RlmEnvironment {
     
     @Override
     public String search(String query) {
-        // Search through stored chunks
-        return chunks.entrySet().stream()
+        if (query == null || query.isBlank()) {
+            return "";
+        }
+        StringBuilder results = new StringBuilder();
+        String normalized = query.toLowerCase();
+
+        String contextSnippet = findInContextSnippet(normalized);
+        if (contextSnippet != null) {
+            results.append("full_context: ").append(contextSnippet);
+        }
+
+        chunks.entrySet().stream()
             .filter(e -> e.getValue() != null && e.getValue().toLowerCase()
-                .contains(query.toLowerCase()))
+                .contains(normalized))
             .map(e -> e.getKey() + ": " + e.getValue())
             .limit(5)
-            .reduce("", (a, b) -> a + "\n\n" + b);
+            .forEach(match -> {
+                if (!results.isEmpty()) {
+                    results.append("\n\n");
+                }
+                results.append(match);
+            });
+
+        return results.toString();
     }
     
     @Override
@@ -216,9 +280,39 @@ public class ExecutableRlmEnvironment implements RlmEnvironment {
             Environment ID: %s
             Working Directory: %s
             Files: %s
+            Context Size: %d
             Context Chunks: %d
             History Steps: %d
             """, 
-            id, workDir, listFiles(), chunks.size(), history.size());
+            id, workDir, listFiles(), contextSize, chunks.size(), history.size());
+    }
+
+    private String buildPythonPrelude() {
+        return """
+            from pathlib import Path
+            CONTEXT_PATH = Path("%s")
+            CONTEXT = CONTEXT_PATH.read_text() if CONTEXT_PATH.exists() else ""
+            WORKDIR = str(Path(".").resolve())
+            """.formatted(CONTEXT_FILENAME);
+    }
+
+    private String findInContextSnippet(String normalizedQuery) {
+        if (contextPath == null || normalizedQuery == null || normalizedQuery.isBlank()) {
+            return null;
+        }
+        try {
+            String context = Files.readString(contextPath);
+            String lowerContext = context.toLowerCase();
+            int index = lowerContext.indexOf(normalizedQuery);
+            if (index < 0) {
+                return null;
+            }
+            int start = Math.max(0, index - 200);
+            int end = Math.min(context.length(), index + 200);
+            return context.substring(start, end);
+        } catch (IOException e) {
+            log.error("Failed to search full context", e);
+            return null;
+        }
     }
 }

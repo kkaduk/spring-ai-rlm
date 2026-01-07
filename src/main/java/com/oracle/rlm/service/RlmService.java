@@ -28,6 +28,9 @@ public class RlmService {
                     .inlineContext(request.getContext())
                     .maxDepth(request.getMaxDepth() != null ? 
                         request.getMaxDepth() : rlmConfig.getMaxDepth())
+                    .maxBranching(request.getMaxBranching() != null ?
+                        request.getMaxBranching() : rlmConfig.getMaxBranching())
+                    .strategy(request.getStrategy())
                     .verbose(Boolean.TRUE.equals(request.getVerbose()))
                     .build();
 
@@ -40,7 +43,7 @@ public class RlmService {
                     .totalSteps(result.getTotalSteps())
                     .maxDepthReached(result.getMaxDepthReached())
                     .processingTimeMs(result.getProcessingTime().toMillis())
-                    .strategy("rlm-action-loop")
+                    .strategy(result.getStrategy())
                     .build();
 
         } catch (Exception e) {

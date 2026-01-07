@@ -10,6 +10,9 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.stereotype.Component;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
@@ -29,6 +32,10 @@ public class DefaultRlmClient implements RlmClient {
     @Override
     public RlmCompletionResult completion(RlmCompletionRequest request) {
         Instant start = Instant.now();
+        int maxDepth = request.getMaxDepth() != null ? request.getMaxDepth() : rlmConfig.getMaxDepth();
+        int maxBranching = request.getMaxBranching() != null
+                ? request.getMaxBranching()
+                : rlmConfig.getMaxBranching();
         
         if (this.chatClient == null) {
             synchronized (this) {
@@ -42,87 +49,21 @@ public class DefaultRlmClient implements RlmClient {
 
         // Get or create environment
         RlmEnvironment env = getOrCreateEnvironment(request);
-        
-        // Setup initial context
-        if (request.getInlineContext() != null) {
-            env.putContextChunk("initial_context", request.getInlineContext());
-        }
-
-        int maxSteps = request.getMaxDepth() != null ? request.getMaxDepth() * 10 : 30;
-        int step = 0;
-        boolean finished = false;
-        String finalAnswer = null;
+        seedEnvironmentContext(env, request.getInlineContext());
 
         try {
-            while (!finished && step < maxSteps) {
-                step++;
-                log.info("RLM Step {}/{}", step, maxSteps);
-
-                // Build prompt with history
-                String userPrompt = promptService.createUserPrompt(
-                        request.getQuery(),
-                        env.getHistory(),
-                        env.getEnvironmentInfo()
-                );
-
-                // Get model response
-                String response = chatClient.prompt()
-                        .user(userPrompt)
-                        .call()
-                        .content();
-
-                // Parse response
-                StepResponse stepResponse = parseStepResponse(response);
-
-                if (stepResponse.finished) {
-                    finished = true;
-                    finalAnswer = stepResponse.answer;
-                    log.info("RLM finished at step {}", step);
-                    break;
-                }
-
-                // Execute tool
-                ToolCall toolCall = ToolCall.builder()
-                        .toolName(stepResponse.tool)
-                        .code(stepResponse.code)
-                        .reasoning(stepResponse.thought)
-                        .build();
-
-                ToolResult result = executeTool(env, toolCall);
-
-                // Record observation
-                ActionObservation observation = ActionObservation.builder()
-                        .step(step)
-                        .thought(stepResponse.thought)
-                        .action(toolCall)
-                        .observation(result)
-                        .timestamp(System.currentTimeMillis())
-                        .build();
-
-                env.addObservation(observation);
-
-                if (!result.isSuccess()) {
-                    log.warn("Tool execution failed at step {}: {}", step, result.getError());
-                }
-            }
-
-            if (!finished) {
-                log.warn("RLM reached max steps ({}) without finishing", maxSteps);
-                finalAnswer = "Maximum steps reached without complete solution. " +
-                             "Last observations: " + summarizeHistory(env.getHistory(), 3);
-            }
-
+            ExecutionResult execution = runCompletion(request, env, 0, maxDepth, maxBranching);
             Duration processingTime = Duration.between(start, Instant.now());
 
             return RlmCompletionResult.builder()
-                    .finalAnswer(finalAnswer)
-                    .totalSteps(step)
-                    .maxDepthReached(step)
+                    .finalAnswer(execution.finalAnswer)
+                    .totalSteps(execution.totalSteps)
+                    .maxDepthReached(execution.maxDepthReached)
                     .processingTime(processingTime)
                     .startedAt(start)
-                    .strategy("rlm-action-loop")
-                    .thoughtProcesses(request.isVerbose() ? 
-                        convertToThoughtProcesses(env.getHistory()) : null)
+                    .strategy("rlm-recursive-repl")
+                    .thoughtProcesses(request.isVerbose()
+                        ? convertToThoughtProcesses(env.getHistory()) : null)
                     .metadata(Map.of(
                             "environmentId", env.getId(),
                             "totalObservations", env.getHistory().size(),
@@ -219,5 +160,204 @@ public class DefaultRlmClient implements RlmClient {
         String code;
         boolean finished;
         String answer;
+    }
+
+    private ExecutionResult runCompletion(RlmCompletionRequest request, RlmEnvironment env,
+                                          int currentDepth, int maxDepth, int maxBranching) {
+        int maxSteps = Math.max(1, maxDepth * 10);
+        int step = 0;
+        int totalSteps = 0;
+        int maxDepthReached = currentDepth;
+        int branchCalls = 0;
+        boolean finished = false;
+        String finalAnswer = null;
+
+        while (!finished && step < maxSteps) {
+            step++;
+            totalSteps++;
+            log.info("RLM Step {}/{} at depth {}", step, maxSteps, currentDepth);
+
+            String userPrompt = promptService.createUserPrompt(
+                    request.getQuery(),
+                    env.getHistory(),
+                    env.getEnvironmentInfo(),
+                    currentDepth,
+                    maxDepth,
+                    maxBranching,
+                    branchCalls
+            );
+
+            String response = chatClient.prompt()
+                    .user(userPrompt)
+                    .call()
+                    .content();
+
+            StepResponse stepResponse = parseStepResponse(response);
+
+            if (stepResponse.finished) {
+                finished = true;
+                finalAnswer = stepResponse.answer;
+                log.info("RLM finished at step {} depth {}", step, currentDepth);
+                break;
+            }
+
+            ToolCall toolCall = ToolCall.builder()
+                    .toolName(stepResponse.tool)
+                    .code(stepResponse.code)
+                    .reasoning(stepResponse.thought)
+                    .build();
+
+            ToolResult result;
+            if ("rlm_call".equalsIgnoreCase(stepResponse.tool)) {
+                RecursiveCallResult recursiveCall = executeRecursiveCall(request, env, stepResponse.code,
+                        currentDepth, maxDepth, maxBranching, branchCalls);
+                result = recursiveCall.toolResult;
+                if (result.isSuccess()) {
+                    branchCalls++;
+                }
+                if (recursiveCall.execution != null) {
+                    totalSteps += recursiveCall.execution.totalSteps;
+                    maxDepthReached = Math.max(maxDepthReached, recursiveCall.execution.maxDepthReached);
+                }
+            } else {
+                result = executeTool(env, toolCall);
+            }
+
+            ActionObservation observation = ActionObservation.builder()
+                    .step(step)
+                    .thought(stepResponse.thought)
+                    .action(toolCall)
+                    .observation(result)
+                    .timestamp(System.currentTimeMillis())
+                    .build();
+
+            env.addObservation(observation);
+
+            if (!result.isSuccess()) {
+                log.warn("Tool execution failed at step {} depth {}: {}", step, currentDepth, result.getError());
+            }
+        }
+
+        if (!finished) {
+            log.warn("RLM reached max steps ({}) without finishing at depth {}", maxSteps, currentDepth);
+            finalAnswer = "Maximum steps reached without complete solution. " +
+                         "Last observations: " + summarizeHistory(env.getHistory(), 3);
+        }
+
+        return new ExecutionResult(finalAnswer, totalSteps, maxDepthReached);
+    }
+
+    private RecursiveCallResult executeRecursiveCall(RlmCompletionRequest request, RlmEnvironment env,
+                                                     String subQuery, int currentDepth, int maxDepth,
+                                                     int maxBranching, int branchCalls) {
+        if (currentDepth + 1 > maxDepth) {
+            return new RecursiveCallResult(ToolResult.builder()
+                    .success(false)
+                    .error("Max recursion depth reached")
+                    .build(), null);
+        }
+        if (branchCalls >= maxBranching) {
+            return new RecursiveCallResult(ToolResult.builder()
+                    .success(false)
+                    .error("Max branching reached at this depth")
+                    .build(), null);
+        }
+        String trimmedQuery = subQuery == null ? "" : subQuery.trim();
+        if (trimmedQuery.isEmpty()) {
+            return new RecursiveCallResult(ToolResult.builder()
+                    .success(false)
+                    .error("rlm_call requires a non-empty sub-query")
+                    .build(), null);
+        }
+
+        RlmEnvironment childEnv = createChildEnvironment(env, currentDepth + 1);
+        try {
+            RlmCompletionRequest childRequest = RlmCompletionRequest.builder()
+                    .query(trimmedQuery)
+                    .environmentId(childEnv.getId())
+                    .maxDepth(maxDepth)
+                    .maxBranching(maxBranching)
+                    .verbose(false)
+                    .backendHints(request.getBackendHints())
+                    .timeout(request.getTimeout())
+                    .strategy(request.getStrategy())
+                    .build();
+
+            long start = System.currentTimeMillis();
+            ExecutionResult childExecution = runCompletion(childRequest, childEnv,
+                    currentDepth + 1, maxDepth, maxBranching);
+            long duration = System.currentTimeMillis() - start;
+
+            ToolResult toolResult = ToolResult.builder()
+                    .success(true)
+                    .output(childExecution.finalAnswer)
+                    .executionTimeMs(duration)
+                    .build();
+            return new RecursiveCallResult(toolResult, childExecution);
+        } finally {
+            environmentStore.deleteEnvironment(childEnv.getId());
+        }
+    }
+
+    private RlmEnvironment createChildEnvironment(RlmEnvironment parent, int depth) {
+        RlmEnvironment child = environmentStore.createEnvironment("child-depth-" + depth);
+        String fullContext = parent.getFullContext();
+        if (fullContext != null) {
+            child.setFullContext(fullContext);
+        }
+        String initialContext = parent.getContextChunk("initial_context");
+        if (initialContext != null) {
+            child.putContextChunk("initial_context", initialContext);
+        }
+        copyWorkingFiles(parent, child);
+        return child;
+    }
+
+    private void copyWorkingFiles(RlmEnvironment parent, RlmEnvironment child) {
+        Path parentDir = Path.of(parent.getCurrentWorkingDirectory());
+        Path childDir = Path.of(child.getCurrentWorkingDirectory());
+        for (String filename : parent.listFiles()) {
+            Path source = parentDir.resolve(filename);
+            Path target = childDir.resolve(filename);
+            try {
+                if (Files.isRegularFile(source)) {
+                    Files.copy(source, target, StandardCopyOption.REPLACE_EXISTING);
+                }
+            } catch (Exception e) {
+                log.warn("Failed to copy file {} to child environment: {}", filename, e.getMessage());
+            }
+        }
+    }
+
+    private void seedEnvironmentContext(RlmEnvironment env, String inlineContext) {
+        if (inlineContext == null || inlineContext.isBlank()) {
+            return;
+        }
+        env.putContextChunk("initial_context", inlineContext);
+        if (env.getFullContext() == null) {
+            env.setFullContext(inlineContext);
+        }
+    }
+
+    private static class ExecutionResult {
+        final String finalAnswer;
+        final int totalSteps;
+        final int maxDepthReached;
+
+        ExecutionResult(String finalAnswer, int totalSteps, int maxDepthReached) {
+            this.finalAnswer = finalAnswer;
+            this.totalSteps = totalSteps;
+            this.maxDepthReached = maxDepthReached;
+        }
+    }
+
+    private static class RecursiveCallResult {
+        final ToolResult toolResult;
+        final ExecutionResult execution;
+
+        RecursiveCallResult(ToolResult toolResult, ExecutionResult execution) {
+            this.toolResult = toolResult;
+            this.execution = execution;
+        }
     }
 }
