@@ -226,15 +226,49 @@ public class DefaultRlmClient implements RlmClient {
         return s.length() <= maxLen ? s : (s.substring(0, maxLen - 3) + "...");
     }
 
+    // Normalize read_file("...") or '...' forms and plain filenames
+    private String normalizeReadFileCode(String code) {
+        if (code == null) return "";
+        String s = code.trim();
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("^\\s*read_file\\s*\\(\\s*['\\\"](.+?)['\\\"]\\s*\\)\\s*;?\\s*$")
+                .matcher(s);
+        if (m.matches()) {
+            return m.group(1);
+        }
+        if ((s.startsWith("\"") && s.endsWith("\"")) || (s.startsWith("'") && s.endsWith("'"))) {
+            return s.substring(1, s.length() - 1);
+        }
+        return s;
+    }
+
+    // Parse write_file('filename', 'content') or fallback to "filename\ncontent"
+    private java.util.Map.Entry<String, String> parseWriteFileCode(String code) {
+        String s = code == null ? "" : code;
+        java.util.regex.Pattern p = java.util.regex.Pattern.compile(
+                "^\\s*write_file\\s*\\(\\s*['\\\"](.+?)['\\\"]\\s*,\\s*['\\\"]([\\s\\S]*?)['\\\"]\\s*\\)\\s*;?\\s*$",
+                java.util.regex.Pattern.DOTALL);
+        java.util.regex.Matcher m = p.matcher(s.trim());
+        if (m.matches()) {
+            String filename = m.group(1);
+            String content = m.group(2);
+            return java.util.Map.entry(filename, content);
+        }
+        String[] parts = s.split("\\n", 2);
+        String filename = parts.length > 0 ? parts[0] : "";
+        String content = parts.length > 1 ? parts[1] : "";
+        return java.util.Map.entry(filename, content);
+    }
+
     private ToolResult executeTool(RlmEnvironment env, ToolCall toolCall) {
         return switch (toolCall.getToolName().toLowerCase()) {
             case "python" -> env.executePython(toolCall.getCode());
             case "bash" -> env.executeBash(toolCall.getCode());
             case "write_file" -> {
-                String[] parts = toolCall.getCode().split("\n", 2);
-                yield env.writeFile(parts[0], parts.length > 1 ? parts[1] : "");
+                java.util.Map.Entry<String, String> args = parseWriteFileCode(toolCall.getCode());
+                yield env.writeFile(args.getKey(), args.getValue());
             }
-            case "read_file" -> env.readFile(toolCall.getCode());
+            case "read_file" -> env.readFile(normalizeReadFileCode(toolCall.getCode()));
             case "search" -> ToolResult.builder()
                     .success(true)
                     .output(env.search(toolCall.getCode()))

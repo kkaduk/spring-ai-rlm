@@ -34,3 +34,5 @@ build/
 response*
 .bloop/
 .metals/
+rlm_env*
+Demo*

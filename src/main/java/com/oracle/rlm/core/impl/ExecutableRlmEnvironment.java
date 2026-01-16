@@ -26,7 +26,15 @@ public class ExecutableRlmEnvironment implements RlmEnvironment {
         this.id = id;
         this.label = label;
         try {
-            this.workDir = Files.createTempDirectory("rlm_env_" + id);
+            // this.workDir = Files.createTempDirectory("rlm_env_" + id);
+            this.workDir = Files.createDirectory(Paths.get("rlm_env_" + id));
+            log.info("Created work directory: {}", workDir);
+            // Ensure context file exists so read_file('context.txt') doesn't fail
+            this.contextPath = workDir.resolve(CONTEXT_FILENAME);
+            if (!Files.exists(this.contextPath)) {
+                Files.writeString(this.contextPath, "");
+            }
+            this.contextSize = Files.size(this.contextPath);
         } catch (IOException e) {
             throw new RuntimeException("Failed to create work directory", e);
         }
@@ -100,7 +108,7 @@ public class ExecutableRlmEnvironment implements RlmEnvironment {
             Files.writeString(scriptPath, wrappedCode);
             
             // Execute with timeout
-            ProcessBuilder pb = new ProcessBuilder("python3", scriptPath.toString());
+            ProcessBuilder pb = new ProcessBuilder("python3", scriptPath.toAbsolutePath().toString());
             pb.directory(workDir.toFile());
             pb.redirectErrorStream(false);
             
