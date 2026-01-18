@@ -82,21 +82,20 @@ sequenceDiagram
     Client->>Model: prompt(system + user incl. history, limits, env info)
 
     loop REPL Steps
-        Model-->>Client: {"thought","tool","code","finished":false} or {"tool":"finish","answer",...}
+        Model-->>Client: JSON step (continue) or JSON step (finish)
         alt tool == "finish"
             Client-->>Service: RlmCompletionResult(finalAnswer, metrics)
             Service-->>Controller: RlmResponse
             Controller-->>User: 200 OK
-            break
-        else tool in {"python","bash","write_file","read_file","search"}
+        else tool in "python|bash|write_file|read_file|search"
             Client->>Env: execute tool
-            Env-->>Client: ToolResult(success,output/error,time)
+            Env-->>Client: ToolResult(success, output/error, time)
             Client->>Client: record ActionObservation
             Client->>Model: next prompt with appended history
         else tool == "rlm_call"
             Client->>Client: enforce maxDepth & maxBranching
             Client->>Env: create child environment (copy files/context)
-            Client->>Model: nested runCompletion(...) at depth+1
+            Client->>Client: run nested completion at depth+1
             Client->>Client: fold child result into observation and continue
         end
     end
