@@ -369,6 +369,26 @@ public class DefaultRlmClient implements RlmClient {
                 }
             } else {
                 result = executeTool(env, toolCall);
+                if ("python".equalsIgnoreCase(stepResponse.tool)) {
+                    Optional<String> pyReq = consumePythonRlmCallRequest(env);
+                    if (pyReq.isPresent()) {
+                        RecursiveCallResult recursiveCall = executeRecursiveCall(request, env, pyReq.get(),
+                                currentDepth, maxDepth, maxBranching, branchCalls);
+                        result = recursiveCall.toolResult;
+                        if (result.isSuccess()) {
+                            branchCalls++;
+                        }
+                        if (recursiveCall.execution != null) {
+                            totalSteps += recursiveCall.execution.totalSteps;
+                            maxDepthReached = Math.max(maxDepthReached, recursiveCall.execution.maxDepthReached);
+                        }
+                        toolCall = ToolCall.builder()
+                                .toolName("rlm_call")
+                                .code(pyReq.get())
+                                .reasoning(stepResponse.thought)
+                                .build();
+                    }
+                }
             }
 
             ActionObservation observation = ActionObservation.builder()
@@ -393,6 +413,24 @@ public class DefaultRlmClient implements RlmClient {
         }
 
         return new ExecutionResult(finalAnswer, totalSteps, maxDepthReached);
+    }
+
+    private Optional<String> consumePythonRlmCallRequest(RlmEnvironment env) {
+        try {
+            Path wd = Path.of(env.getCurrentWorkingDirectory());
+            Path req = wd.resolve("rlm_tool_request.json");
+            if (!Files.exists(req)) return Optional.empty();
+            String json = Files.readString(req);
+            try { Files.deleteIfExists(req); } catch (Exception ignore) {}
+            JsonNode node = objectMapper.readTree(json);
+            if (node.has("tool") && "rlm_call".equalsIgnoreCase(node.get("tool").asText())) {
+                String code = node.has("code") ? node.get("code").asText() : "";
+                return Optional.ofNullable(code);
+            }
+        } catch (Exception e) {
+            log.warn("Failed to consume python rlm_call request: {}", e.toString());
+        }
+        return Optional.empty();
     }
 
     private RecursiveCallResult executeRecursiveCall(RlmCompletionRequest request, RlmEnvironment env,

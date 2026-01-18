@@ -298,9 +298,19 @@ public class ExecutableRlmEnvironment implements RlmEnvironment {
     private String buildPythonPrelude() {
         return """
             from pathlib import Path
+            import json
             CONTEXT_PATH = Path("%s")
             CONTEXT = CONTEXT_PATH.read_text() if CONTEXT_PATH.exists() else ""
             WORKDIR = str(Path(".").resolve())
+
+            # Python-to-RLM tool bridge: request an RLM tool by writing a JSON file the orchestrator will consume.
+            def rlm_call(sub_query):
+                try:
+                    req = {"tool": "rlm_call", "code": str(sub_query)}
+                    Path("rlm_tool_request.json").write_text(json.dumps(req))
+                    print("RLM_TOOL_REQUEST: rlm_call scheduled")
+                except Exception as e:
+                    print(f"ERROR: failed to schedule rlm_call: {e}")
             """.formatted(CONTEXT_FILENAME);
     }
 

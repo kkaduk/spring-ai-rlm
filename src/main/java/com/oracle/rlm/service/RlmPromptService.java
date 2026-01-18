@@ -39,6 +39,7 @@ public class RlmPromptService {
 
             When you need to solve a sub-problem, use the rlm_call tool with the
             sub-query in the "code" field. Do not include the full context in the prompt.
+            If you are writing Python code, you can alternatively call rlm_call("sub-query") to schedule a recursive call; the orchestrator will execute it after the python step.
             
             IMPORTANT OUTPUT REQUIREMENTS:
             - Respond ONLY with a single valid JSON object. 
