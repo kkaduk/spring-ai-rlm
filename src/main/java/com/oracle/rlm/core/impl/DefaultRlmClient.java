@@ -242,22 +242,63 @@ public class DefaultRlmClient implements RlmClient {
         return s;
     }
 
-    // Parse write_file('filename', 'content') or fallback to "filename\ncontent"
+    // Parse write_file(...) robustly; prefer "filename\ncontent" format, but also support write_file('filename', <content>)
     private java.util.Map.Entry<String, String> parseWriteFileCode(String code) {
         String s = code == null ? "" : code;
-        java.util.regex.Pattern p = java.util.regex.Pattern.compile(
-                "^\\s*write_file\\s*\\(\\s*['\\\"](.+?)['\\\"]\\s*,\\s*['\\\"]([\\s\\S]*?)['\\\"]\\s*\\)\\s*;?\\s*$",
-                java.util.regex.Pattern.DOTALL);
-        java.util.regex.Matcher m = p.matcher(s.trim());
-        if (m.matches()) {
-            String filename = m.group(1);
-            String content = m.group(2);
+        String t = s.trim();
+
+        // 1) Prefer explicit write_file(...) if present to avoid splitting on newlines inside content
+        if (t.toLowerCase(Locale.ROOT).startsWith("write_file")) {
+            int open = t.indexOf('(');
+            int close = t.lastIndexOf(')');
+            if (open != -1 && close > open) {
+                String args = t.substring(open + 1, close);
+                // Extract first quoted argument as filename, honoring escapes
+                int i = 0;
+                while (i < args.length() && Character.isWhitespace(args.charAt(i))) i++;
+                if (i < args.length() && (args.charAt(i) == '\'' || args.charAt(i) == '"')) {
+                    char q = args.charAt(i++);
+                    StringBuilder fname = new StringBuilder();
+                    boolean escaped = false;
+                    while (i < args.length()) {
+                        char c = args.charAt(i++);
+                        if (escaped) { fname.append(c); escaped = false; continue; }
+                        if (c == '\\') { escaped = true; continue; }
+                        if (c == q) break;
+                        fname.append(c);
+                    }
+                    // advance to first comma separating args
+                    while (i < args.length() && args.charAt(i) != ',') i++;
+                    if (i < args.length() && args.charAt(i) == ',') i++;
+                    while (i < args.length() && Character.isWhitespace(args.charAt(i))) i++;
+                    String contentArg = args.substring(i).trim();
+                    // If surrounded by matching quotes, strip outermost quotes
+                    if (contentArg.length() >= 2) {
+                        char c0 = contentArg.charAt(0);
+                        char c1 = contentArg.charAt(contentArg.length() - 1);
+                        if ((c0 == '\'' && c1 == '\'') || (c0 == '"' && c1 == '"')) {
+                            contentArg = contentArg.substring(1, contentArg.length() - 1);
+                        }
+                    }
+                    // Unescape common sequences that may appear inside the explicit string literal
+                    contentArg = contentArg.replace("\\n", "\n")
+                                           .replace("\\t", "\t")
+                                           .replace("\\r", "\r");
+                    return java.util.Map.entry(fname.toString(), contentArg);
+                }
+            }
+        }
+
+        // 2) Fallback format: "filename\ncontent"
+        int nl = s.indexOf('\n');
+        if (nl >= 0) {
+            String filename = s.substring(0, nl).trim();
+            String content = s.substring(nl + 1);
             return java.util.Map.entry(filename, content);
         }
-        String[] parts = s.split("\\n", 2);
-        String filename = parts.length > 0 ? parts[0] : "";
-        String content = parts.length > 1 ? parts[1] : "";
-        return java.util.Map.entry(filename, content);
+
+        // 3) Fallback: treat the whole string as filename, empty content
+        return java.util.Map.entry(t, "");
     }
 
     private ToolResult executeTool(RlmEnvironment env, ToolCall toolCall) {
@@ -520,7 +561,8 @@ public class DefaultRlmClient implements RlmClient {
             return;
         }
         env.putContextChunk("initial_context", inlineContext);
-        if (env.getFullContext() == null) {
+        String existingContext = env.getFullContext();
+        if (existingContext == null || existingContext.isBlank()) {
             env.setFullContext(inlineContext);
         }
     }

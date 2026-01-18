@@ -50,6 +50,27 @@ public class RlmPromptService {
               { "thought": "summary", "tool": "finish", "answer": "final answer", "finished": true }
             - Valid tool_name values: "python", "bash", "write_file", "read_file", "search", "rlm_call", "finish".
             - Place any code/command to execute in the "code" field.
+            
+            Tool input formats (STRICT):
+            - write_file:
+              The "code" MUST be ONE of the following:
+              1) "FILENAME\nCONTENT"  (filename on first line, then a newline, then the full file content)
+              2) write_file("FILENAME", "CONTENT")
+              Notes:
+              - Do NOT use code fences.
+              - CONTENT may be long and include newlines; include the full content.
+              - If writing context.txt, use exactly "context.txt" as the filename.
+              Example:
+              {
+                "thought": "persist architecture draft",
+                "tool": "write_file",
+                "code": "architecture_vision_draft.txt\nLine 1\nLine 2\nLine 3",
+                "finished": false
+              }
+            - read_file:
+              The "code" MUST be either:
+              1) "FILENAME"
+              2) read_file("FILENAME")
 
             Example (continue):
             {

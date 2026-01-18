@@ -192,15 +192,26 @@ public class ExecutableRlmEnvironment implements RlmEnvironment {
     @Override
     public ToolResult writeFile(String filename, String content) {
         try {
+            if (filename == null || filename.isBlank()) {
+                return ToolResult.builder()
+                    .success(false)
+                    .error("write_file requires a non-empty filename")
+                    .build();
+            }
             Path filePath = workDir.resolve(filename);
-            Files.writeString(filePath, content);
-            if (CONTEXT_FILENAME.equals(filename)) {
+            Path parent = filePath.getParent();
+            if (parent != null && !Files.exists(parent)) {
+                Files.createDirectories(parent);
+            }
+            String safeContent = content == null ? "" : content;
+            Files.writeString(filePath, safeContent);
+            if (CONTEXT_FILENAME.equals(filePath.getFileName().toString())) {
                 contextPath = filePath;
-                contextSize = content != null ? content.length() : 0;
+                contextSize = safeContent.length();
             }
             return ToolResult.builder()
                 .success(true)
-                .output("File written: " + filename)
+                .output("File written: " + filePath.getFileName())
                 .build();
         } catch (IOException e) {
             return ToolResult.builder()
