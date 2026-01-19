@@ -1,0 +1,37 @@
+# spring:
+#   application:
+#     name: spring-ai-rlm
+  
+#   ai:
+#     openai:
+#       api-key: ${OPENAI_API_KEY}
+#       chat:
+#         options:
+#           model: gpt-4
+#           temperature: 0.7
+#           max-tokens: 2000
+  
+#   cache:
+#     type: caffeine
+#     caffeine:
+#       spec: maximumSize=100,expireAfterWrite=3600s
+
+# server:
+#   port: 8080
+
+# # RLM Configuration
+# rlm:
+#   max-depth: 3
+#   max-branching: 3
+#   timeout-seconds: 30
+#   enable-caching: true
+#   decomposition-temperature: 0.8
+#   solving-temperature: 0.7
+#   aggregation-temperature: 0.6
+
+# logging:
+#   level:
+#     com.example.rlm: DEBUG
+#     org.springframework.ai: INFO
+#   pattern:
+#     console: "%d{yyyy-MM-dd HH:mm:ss} - %msg%n"
